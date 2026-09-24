@@ -14,6 +14,7 @@ mocked, so the lab runs on a laptop with nothing but Docker.
 
 - [Architecture](#architecture)
   - [What each piece does, and why it's there](#what-each-piece-does-and-why-its-there)
+  - [Why these tools](#why-these-tools)
 - [Set it up](#set-it-up)
 - [Connect a client](#connect-a-client)
 - [Things to try](#things-to-try)
@@ -212,6 +213,155 @@ The gateway, the MCP server and the backends all verify tokens, and none of it i
 redundant. The gateway checks cheaply to reject junk early. The MCP server checks
 because it makes the decision. The backends check because they hold the data. Each
 check guards against a different failure.
+
+### Why these tools
+
+The section above explains what each *role* is for. This one explains why we picked
+*these particular tools* to fill them, and which ones are only there so the lab runs on a
+laptop.
+
+**At a glance.** "Core" means the tool is part of the architecture and you'd run it in
+production too. "Laptop only" means it's there to make the lab self-contained, and you'd
+drop it or swap it for the real thing.
+
+| Tool | What it is, in one line | Why we need it here | Core or laptop only? |
+| --- | --- | --- | --- |
+| **Keycloak** | Open-source identity server: logins, SSO, OAuth 2 / OpenID Connect tokens | The OAuth server MCP clients require, plus brokering to each company's SSO | Core |
+| **Apache APISIX** | Open-source API gateway: a programmable reverse proxy with plugins | One hardened public entrance: token pre-check, rate limits, header stripping | Core |
+| **PostgreSQL** | Open-source relational database | Assignments, audit log, single-use confirmations; also Keycloak's database | Core |
+| **Redis** | In-memory key-value store, very fast counters with expiry | Rate limits shared by every MCP server copy and gateway node | Core |
+| **Node.js + TypeScript + MCP SDK** | JavaScript runtime, typed JavaScript, and the official MCP library | The MCP server itself; also the mock backends and config scripts | Core (the MCP server) |
+| **Docker + Compose** | Containers, and a tool to run many of them together from one file | Starts the whole stack with one command | Laptop only (production uses Kubernetes or VMs) |
+| **etcd** | Distributed key-value store used by APISIX to hold its config | Only so the APISIX dashboard can browse and edit routes | Laptop only (optional) |
+| **Mock company SSO realms** | Extra Keycloak realms pretending to be Entra ID / Okta | Stand-ins for each company's real SSO | Laptop only |
+| **Mock portal-api / rest-api** | Tiny Node services with fake data | Stand-ins for the real platform APIs | Laptop only (the auth middleware is the real pattern) |
+| **Swagger UI** | Web page that renders OpenAPI files as browsable API docs | Lets you see the mocked APIs | Laptop only (optional) |
+| **cloudflared** | Cloudflare's tunnel client: gives a local port a public HTTPS URL | Lets claude.ai / ChatGPT, which live in the cloud, reach your laptop | Laptop only (optional) |
+| **mcp-remote** | Small npm tool that bridges a local MCP client to a remote MCP server | Lets Claude Desktop use this server through `claude_desktop_config.json` | Client side, optional |
+
+#### Keycloak
+
+- **What it is:** an open-source (Apache-2.0) identity and access management server. It logs
+  people in, federates with other identity providers, and issues OAuth 2 / OpenID Connect tokens.
+- **Why we need an authorization server at all:** Claude and ChatGPT only connect to remote
+  MCP servers through the standard MCP OAuth flow. That flow includes discovery,
+  self-registration of clients (DCR), PKCE, consent, and tokens bound to one MCP server.
+  Something has to speak it.
+- **Why not connect Claude straight to Entra ID (or Okta):** those are the companies'
+  SSOs, and they can't act as an MCP authorization server for us. They don't let arbitrary
+  AI clients register themselves, and they can't issue tokens whose audience is our MCP
+  server. Brokering through our own server also gives every company one issuer and one
+  token format.
+- **Why Keycloak:** it has everything this design leans on, in the free version:
+  - **Standard token exchange,** for the one-tenant internal token.
+  - **Claims shaped with mappers and scopes,** without writing code.
+  - **Deep SSO brokering, plus Organizations,** to route each email domain to its company's
+    SSO.
+  - **RFC 9207 `iss`** in the login response.
+  - **Mature Dynamic Client Registration policies.**
+  - **Self-hosted, with no licence cost.**
+- **Alternatives considered:**
+  - **Zitadel** is very close. It has the cleanest built-in tenant model. But it's AGPL when
+    self-hosted, and at the time of the design it lacked RFC 9207 and client metadata
+    documents (CIMD).
+  - **Auth0 / Okta Customer Identity** are paid SaaS.
+  - **Entra ID** can't play this role (see above).
+- **Laptop vs production:** here it runs in dev mode on one node. In production: 2+ nodes on
+  a managed Postgres, realm config as code (like `bootstrap.mjs`), and events shipped to
+  your log pipeline.
+
+#### Apache APISIX
+
+- **What it is:** an open-source (Apache-2.0) API gateway built on NGINX/OpenResty. You
+  define routes, attach plugins (auth, rate limiting, rewriting, logging) and point them
+  at upstream services.
+- **Why we need a gateway:** one public entrance where junk is stopped cheaply before it
+  reaches the MCP server or Keycloak. It checks token signature and audience, rate-limits,
+  caps request sizes, strips identity headers clients try to smuggle in, and hides the
+  admin console and master realm.
+- **Why APISIX:** everything we use here is in the open-source edition:
+  - **OpenID Connect / JWT validation** with rotating keys (JWKS) and audience checks.
+  - **Rate limits backed by Redis,** correct across several gateway nodes.
+  - **Response rewriting,** for the MCP login challenge.
+  - **A built-in dashboard.**
+  - **A plain-YAML standalone mode** for Git-managed config.
+- **Alternatives considered:**
+  - **Kong:** OIDC and advanced rate limiting are Enterprise (paid) features; the free JWT
+    plugin can't follow rotating keys or check the audience.
+  - **Traefik:** OIDC and MCP features are in paid Traefik Hub.
+  - **Envoy:** powerful, but you assemble it from low-level filters.
+  - **Plain NGINX:** no OIDC without NGINX Plus.
+- **Laptop vs production:** in production you'd run 2+ identical nodes in **standalone YAML
+  mode** (config file from Git, no etcd), with TLS, logs shipped out and a WAF (for example
+  Coraza with the OWASP rules). The lab uses etcd only for the dashboard (see etcd below).
+
+#### PostgreSQL
+
+- **What it is:** an open-source relational database: tables, SQL, transactions, constraints.
+- **Why we need it:** three things must be correct and durable:
+  - **Who may work in which tenant** (assignments). Foreign keys, expiry dates and a trigger
+    log every change.
+  - **The audit log.** Queryable per tenant or person.
+  - **Which confirmation ids were already used.** One atomic insert makes them single-use
+    across all MCP server copies.
+- **Why PostgreSQL:** transactions and constraints fit this data. Keycloak needs a database
+  anyway and supports Postgres officially, so one engine serves both (in separate databases).
+- **Alternatives:** MySQL/MariaDB would also work. A document store or a key-value store would
+  make the constraints and audit queries harder.
+- **Laptop vs production:** a managed Postgres with backups, and probably separate
+  instances for Keycloak and the platform data.
+
+#### Redis
+
+- **What it is:** an in-memory key-value store. It's very fast, and keys can expire on their own.
+- **Why we need it:** rate limits per (person, tenant, risk tier) must count calls across
+  **all** MCP server copies, and the gateway's per-IP limits across all gateway nodes.
+  Counters kept in each process's memory would each see only part of the traffic.
+- **Why Redis:** atomic `INCR` plus expiry is exactly a rate-limit window, and APISIX supports
+  it natively (`policy: redis`).
+- **Alternatives:** counting in Postgres (slower, more load on the database), or
+  Memcached (no atomic counters with the same guarantees). Valkey, an open-source Redis
+  fork, is a drop-in replacement.
+- **Laptop vs production:** a managed Redis/Valkey. If it's down, the lab refuses calls rather
+  than letting them through unlimited.
+
+#### Node.js, TypeScript and the official MCP SDK
+
+- **What they are:** Node.js runs JavaScript on the server. TypeScript adds types to
+  JavaScript. `@modelcontextprotocol/sdk` is the official MCP library from the protocol's
+  maintainers.
+- **Why we need them:** the MCP server is the one piece we write ourselves.
+- **Why this stack:** the TypeScript SDK is the **reference implementation**, so it gets new
+  spec features (auth, transports, protocol versions) first. It also covers what we need:
+  stateless Streamable HTTP, JSON Schema tool inputs, and tool annotations. The same runtime
+  also runs the mock backends, the config scripts and the tests.
+- **Alternatives:** the Python SDK / FastMCP, Java (Spring AI), or Go. All are viable. Pick what
+  your team maintains best.
+- **Laptop vs production:** the MCP server is core. You'd deploy several copies per zone
+  behind the gateway. That's safe because it's stateless.
+
+#### Docker and Docker Compose
+
+- **What they are:** Docker runs each service in an isolated container. Compose starts many
+  containers together from one file (`docker-compose.yml`), with a private network between them.
+- **Why we need them:** twelve services on a laptop (two of them one-shot setup jobs, and the
+  tunnel only on demand), started with one command, the same way on every machine.
+- **Laptop vs production:** laptop only. In production the same container images would run on
+  Kubernetes or VMs, with managed Postgres and Redis.
+
+#### Optional and laptop-only pieces
+
+You can remove or ignore these without changing how the architecture works.
+
+| Piece | What it is | Why it's in the lab | Can I skip it? |
+| --- | --- | --- | --- |
+| **etcd** | Distributed key-value store; APISIX's config store in its "traditional" mode | APISIX's built-in dashboard only works when config lives in etcd. `apisix/apisix.yaml` stays the source of truth (the `gateway-seed` job pushes it) | Yes. Switch APISIX to standalone YAML mode and drop etcd, `gateway-seed` and the dashboard. That's what you'd do in production |
+| **Mock company SSO realms** (`corecenas-entra`, `masikea-entra`, `vodafundas-okta`) | Extra Keycloak realms | Pretend to be each company's Entra ID / Okta, so the brokered login works offline | Not in the lab, but in production they're replaced by the companies' real SSOs |
+| **Mock portal-api / rest-api** | Small Node services with fake data | Give the tools something to call | In production they're replaced by the real APIs, which only need the same token-checking middleware |
+| **Swagger UI** (`api-docs`) | Renders OpenAPI files as a web page | Browse the mocked APIs on port 8082 | Yes. `docker compose stop api-docs` |
+| **cloudflared** | Cloudflare quick-tunnel client | A public HTTPS URL, so claude.ai / ChatGPT can reach your laptop | Yes. Only started by `make tunnel`; Claude Desktop and Claude Code work without it. In production the gateway has a real domain and TLS certificate |
+| **mcp-remote** | npm bridge from a local MCP client to a remote server | Lets Claude Desktop connect through its config file, with the OAuth login done on your machine | Yes, if you use a Claude Desktop custom connector (needs the tunnel) or Claude Code instead |
+| **`bootstrap` and `gateway-seed` jobs** | One-shot containers that apply config | Configure Keycloak and APISIX from files in this repo | Keep the *idea* (configuration as code). In production they'd run in your CI/CD pipeline |
 
 ---
 
