@@ -31,9 +31,9 @@ services:
       interval: 3s
       retries: 30
 
-  # Platform authorization server. One issuer: ${PUBLIC_URL}/realms/platform.
-  # The realm "corp-entra" stands in for the company's Entra ID tenant and is
-  # brokered by realm "platform" exactly as Entra would be.
+  # CoreCenas' authorization server. One issuer: ${PUBLIC_URL}/realms/platform.
+  # One more realm per company (corecenas-entra, masikea-entra, vodafundas-okta)
+  # plays that company's own SSO, brokered by realm "platform".
   keycloak:
     image: quay.io/keycloak/keycloak:26.7
     command: ["start-dev"]
@@ -68,7 +68,7 @@ services:
       <<: *node-env
       KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
       MCP_TOKEN_EXCHANGE_SECRET: ${MCP_TOKEN_EXCHANGE_SECRET:-local-mcp-exchange-secret}
-      ENTRA_BROKER_SECRET: ${ENTRA_BROKER_SECRET:-local-entra-broker-secret}
+      SSO_BROKER_SECRET: ${SSO_BROKER_SECRET:-local-sso-broker-secret}
       DEMO_PASSWORD: ${DEMO_PASSWORD:-Passw0rd!}
     volumes:
       # folder mount: single-file bind mounts can go stale on Docker Desktop for macOS

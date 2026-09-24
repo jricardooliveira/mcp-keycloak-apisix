@@ -6,8 +6,9 @@ CREATE DATABASE keycloak OWNER platform;
 -- Tenants and the zone that serves them.
 CREATE TABLE tenants (
   tenant_id integer PRIMARY KEY,
-  name       text NOT NULL,
-  zone       text NOT NULL
+  name      text NOT NULL,
+  zone      text NOT NULL,
+  company   text  -- Organization alias of the client company that owns it
 );
 
 -- Principals known to the store, keyed on the Platform AS subject (never the Entra oid).

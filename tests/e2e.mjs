@@ -3,12 +3,12 @@
 // registration -> PKCE authorization (brokered login at mock Entra + consent)
 // -> token -> MCP calls exercising tenant isolation, roles and confirmation.
 //
-//   node tests/e2e.mjs [username] [password]      (defaults: alice / Passw0rd!)
+//   node tests/e2e.mjs [email] [password]   (defaults: alice@corecenas.example / Passw0rd!)
 import { createHash, randomBytes } from "node:crypto";
 import assert from "node:assert/strict";
 
 const MCP = process.env.MCP_URL ?? "http://localhost:9080/mcp";
-const [username = "alice", password = "Passw0rd!"] = process.argv.slice(2);
+const [username = "alice@corecenas.example", password = "Passw0rd!"] = process.argv.slice(2);
 const REDIRECT = "http://localhost:33418/callback";
 
 // Minimal path-aware cookie jar (both realms set AUTH_SESSION_ID on their own path).
@@ -61,7 +61,7 @@ assert.equal(res.status, 201, JSON.stringify(client));
 console.log({ client_id: client.client_id });
 
 // 3. Authorization code + PKCE, brokered through mock Entra, with consent
-step(`authorize as ${username} (PKCE S256, resource indicator)`);
+step(`authorize as ${username} (PKCE S256, resource indicator, email-first login)`);
 const verifier = randomBytes(32).toString("base64url");
 const state = randomBytes(8).toString("hex");
 const authz = new URL(meta.authorization_endpoint);
@@ -82,8 +82,11 @@ for (let hops = 0; hops < 20 && !callback; hops++) {
   const html = await res.text();
   const action = html.match(/<form[^>]*action="([^"]+)"/)?.[1];
   if (!action) throw new Error(`unexpected page at ${url}: ${html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").slice(0, 600)}`);
-  if (html.includes('name="password"')) {
-    console.log("login page:", new URL(url).pathname.split("/protocol")[0]);
+  if (html.includes('name="username"') && !html.includes('name="password"')) {
+    console.log("email-first page:", new URL(url).pathname.split("/login-actions")[0].split("/protocol")[0]);
+    res = await http(new URL(decode(action), url).toString(), form({ username }));
+  } else if (html.includes('name="password"')) {
+    console.log("company SSO login page:", new URL(url).pathname.split("/protocol")[0].split("/login-actions")[0]);
     res = await http(new URL(decode(action), url).toString(), form({ username, password }));
   } else if (html.includes('name="accept"')) {
     console.log("consent page:", [...html.matchAll(/<li[^>]*>\s*<span[^>]*>([^<]+)<\/span>/g)].map((m) => m[1].trim()).join(" | "));
@@ -110,7 +113,7 @@ res = await http(meta.token_endpoint, form({
 const tokens = await res.json();
 assert.equal(res.status, 200, JSON.stringify(tokens));
 const claims = JSON.parse(Buffer.from(tokens.access_token.split(".")[1], "base64url").toString());
-console.log({ aud: claims.aud, scope: claims.scope, principal_type: claims.principal_type, expires_in: tokens.expires_in, refresh: !!tokens.refresh_token });
+console.log({ aud: claims.aud, scope: claims.scope, principal_type: claims.principal_type, company: claims.company, expires_in: tokens.expires_in, refresh: !!tokens.refresh_token });
 
 // 4. MCP
 let id = 0;
@@ -159,7 +162,8 @@ const show = async (label, name, args) => {
 };
 
 step("authorization checks");
-await show("T0 read in assigned tenant 1001", "list_campaigns", { tenant_id: 1001 });
+await show("T0 read in tenant 1001 (MasIkea)", "list_campaigns", { tenant_id: 1001 });
+await show("T0 read in tenant 1002 (VodaFundas)", "list_campaigns", { tenant_id: 1002 });
 await show("T1 PII read (purpose recorded)", "search_customers", { tenant_id: 1001, q: "maria", purpose: "Check VIP segment membership" });
 await show("tenant in another zone (2001)", "list_campaigns", { tenant_id: 2001 });
 await show("unassigned / unknown tenant 9999", "list_campaigns", { tenant_id: 9999 });

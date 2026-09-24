@@ -169,7 +169,7 @@ paths:
                 properties:
                   message_id: { type: string, example: sms-1001 }
                   to: { type: string }
-                  sender: { type: string, example: ACME }
+                  sender: { type: string, example: MASIKEA }
                   status: { type: string, enum: [queued] }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "409": { description: Recipient is blacklisted, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }

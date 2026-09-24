@@ -29,7 +29,7 @@ async function invoke(tool: ToolDef, principal: Principal, rawArgs: Record<strin
   const audit: AuditRecord = {
     requestId: randomUUID(), subject: principal.subject, email: principal.email, principalType: principal.principalType,
     clientId: principal.clientId, tool: tool.name, tier: tool.tier, tenantId: args.tenant_id,
-    argsHash: hashArgs(args), argsRedacted: redactArgs(args), confirmationId, outcome: "denied",
+    argsHash: hashArgs(args), argsRedacted: redactArgs(args), confirmationId: confirmationId?.slice(0, 16), outcome: "denied",
   };
   const ctx: ToolContext = { principal };
 
@@ -43,6 +43,11 @@ async function invoke(tool: ToolDef, principal: Principal, rawArgs: Record<strin
       if (!tenant) throw new Denied(`unknown tenant ${tenantId}`);
       if (tenant.zone !== config.zone) {
         throw new Denied(`tenant ${tenantId} (${tenant.name}) is served by zone ${tenant.zone}; use the mcp${tenant.zone} server`);
+      }
+      // A client company's users only ever work in their own company's tenant,
+      // whatever the assignment store says.
+      if (principal.principalType === "customer_user" && (!tenant.company || tenant.company !== principal.company)) {
+        throw new Denied(`tenant ${tenantId} (${tenant.name}) belongs to another company; you can only work in your own company's tenant`);
       }
       const assignment = await getAssignment(principal.subject, tenantId);
       if (!assignment) throw new Denied(`no active assignment to tenant ${tenantId}`);
@@ -105,10 +110,10 @@ async function invoke(tool: ToolDef, principal: Principal, rawArgs: Record<strin
 
 function buildServer(principal: Principal): McpServer {
   const server = new McpServer(
-    { name: config.serverName, title: "Contact Center Platform", version: "0.1.0" },
+    { name: config.serverName, title: "CoreCenas Contact Center", version: "0.1.0" },
     {
       instructions:
-        "Tools act on Contact Center Platform tenants. Call get_my_context first to see which tenant_id values you may use. " +
+        "Tools act on CoreCenas contact-center tenants (one per client company). Call get_my_context first to see which tenant_id values you may use. " +
         "Every tenant tool needs an explicit tenant_id. Write tools run in two steps: the first call returns a plan and a confirmation_id; " +
         "show the plan to the user and only call again with confirmation_id once they agree.",
     },
@@ -159,7 +164,7 @@ const prm = {
   authorization_servers: [config.issuer],
   scopes_supported: config.scopesSupported,
   bearer_methods_supported: ["header"],
-  resource_name: `Contact Center Platform (${config.zone})`,
+  resource_name: `CoreCenas Contact Center (${config.zone})`,
 };
 app.get(["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"], (_req, res) => res.json(prm));
 

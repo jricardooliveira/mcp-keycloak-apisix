@@ -5,7 +5,7 @@ export const ROLES = ["viewer", "support_operator", "supervisor", "admin"] as co
 export type Role = (typeof ROLES)[number];
 export const roleRank = (r: Role) => ROLES.indexOf(r);
 
-export interface Tenant { tenantId: number; name: string; zone: string }
+export interface Tenant { tenantId: number; name: string; zone: string; company: string | null }
 export interface Assignment { tenantId: number; role: Role; expiresAt: Date | null; tenantName: string; zone: string }
 
 const pool = new pg.Pool({ connectionString: config.databaseUrl, max: 10 });
@@ -16,8 +16,8 @@ const CACHE_MS = 60_000;
 const assignmentCache = new Map<string, { value: Assignment | null; at: number }>();
 
 export async function getTenant(tenantId: number): Promise<Tenant | null> {
-  const { rows } = await pool.query("SELECT tenant_id, name, zone FROM tenants WHERE tenant_id = $1", [tenantId]);
-  return rows[0] ? { tenantId: rows[0].tenant_id, name: rows[0].name, zone: rows[0].zone } : null;
+  const { rows } = await pool.query("SELECT tenant_id, name, zone, company FROM tenants WHERE tenant_id = $1", [tenantId]);
+  return rows[0] ? { tenantId: rows[0].tenant_id, name: rows[0].name, zone: rows[0].zone, company: rows[0].company } : null;
 }
 
 /** The active assignment of subject to tenant, or null. ROOT has no meaning here. */

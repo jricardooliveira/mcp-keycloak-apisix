@@ -1,13 +1,16 @@
 # mcp-keycloak-apisix
 
 A working, all-in-containers lab of an **OAuth-protected, multi-tenant MCP server**.
-It runs an MCP server that Claude Desktop, Claude Code, claude.ai and ChatGPT can
-connect to. Before using any tool you **sign in** through a standard OAuth login;
-after that, every tool call is checked against which tenants you're assigned to,
-with which role, and written to an audit log.
 
-Everything behind the MCP server (portal-api, rest-api, Entra ID) is mocked, so the lab runs
-on a laptop with nothing but Docker.
+**CoreCenas** runs a contact-center platform. Its client companies, **MasIkea** and
+**VodaFundas**, each have their own tenant on it. This lab gives the platform an MCP
+server that Claude Desktop, Claude Code, claude.ai and ChatGPT can connect to. Before
+using any tool you **sign in with your own company's SSO**; after that, every tool call
+is checked against which tenants you're assigned to, with which role, and written to an
+audit log.
+
+Everything behind the MCP server (the platform's APIs, and each company's SSO) is
+mocked, so the lab runs on a laptop with nothing but Docker.
 
 - [Architecture](#architecture)
   - [What each piece does, and why it's there](#what-each-piece-does-and-why-its-there)
@@ -17,7 +20,7 @@ on a laptop with nothing but Docker.
 - [Consoles and dashboards](#consoles-and-dashboards)
 - [How to change things](#how-to-change-things)
 - [How it works](#how-it-works)
-- [FAQ](#faq)
+- [FAQ (with example payloads)](#faq)
 - [Troubleshooting](#troubleshooting)
 - [Lab simplifications](#lab-simplifications)
 
@@ -30,7 +33,9 @@ flowchart LR
   C["AI client<br/>Claude / ChatGPT"] --> G["APISIX gateway<br/>:9080"]
   G --> M["MCP server<br/>zone eu1"]
   G --> K["Keycloak realm platform<br/>authorization server"]
-  K --> E["Keycloak realm corp-entra<br/>mock company SSO"]
+  K --> E1["CoreCenas Entra ID<br/>(staff, mock)"]
+  K --> E2["MasIkea Entra ID<br/>(mock)"]
+  K --> E3["VodaFundas Okta<br/>(mock)"]
   M --> S[("Postgres<br/>assignments + audit")]
   M --> R[("Redis<br/>rate limits")]
   M -- "token exchange" --> K
@@ -44,8 +49,8 @@ network.
 | Part | What it does | Where it lives |
 | --- | --- | --- |
 | **APISIX** | The only public entrance. Checks tokens early, rate-limits, strips smuggled identity headers | `apisix/apisix.yaml` (routes), `apisix/config.yaml` |
-| **Keycloak `platform` realm** | The OAuth server: login, consent, tokens, self-registration of AI clients, token exchange | configured by `bootstrap/bootstrap.mjs` |
-| **Keycloak `corp-entra` realm** | Simulates a client company's SSO (e.g. Company A's Entra ID). Holds the demo users and passwords | `bootstrap/directory.json` |
+| **Keycloak realm `platform`** | CoreCenas' OAuth server: login, consent, tokens, self-registration of AI clients, token exchange | configured by `bootstrap/bootstrap.mjs` |
+| **Keycloak realms `corecenas-entra`, `masikea-entra`, `vodafundas-okta`** | Mock SSOs: CoreCenas' own (for staff) and one per client company. They hold the users and passwords | `bootstrap/directory.json` |
 | **MCP server** | The decision point: which person, which tool, which tenant, which role | `mcp-server/src/` (TypeScript) |
 | **Postgres** | Tenants, assignments (who may work where), audit log. Also Keycloak's database | `db/init/01-schema.sql` |
 | **Redis** | Rate-limit counters per person, tenant and risk tier | — |
@@ -54,17 +59,17 @@ network.
 
 ### What each piece does, and why it's there
 
-Think of the platform as an office building where each customer (tenant) has its own
-rooms. Each piece of the lab answers **exactly one question**, and none of them trusts
-another to answer its question for it. That's the test for whether a piece belongs:
-take it away, and something specific breaks or becomes unsafe.
+Think of the platform as an office building where each client company (tenant) has its
+own rooms. Each piece of the lab answers **exactly one question**, and none of them
+trusts another to answer its question for it. That's the test for whether a piece
+belongs: take it away, and something specific breaks or becomes unsafe.
 
 | Piece | The one question it answers | In the building |
 | --- | --- | --- |
 | AI client | "What does the person want done?" | the visitor asking for something |
 | APISIX gateway | "Is this request well-formed and not an attack?" | the front door with the security scanner |
 | Keycloak (`platform` realm) | "Who is this person, and did they agree to let this AI act for them?" | reception, which checks ID and hands out visitor badges |
-| Mock company SSO (`corp-entra`) | "Is this really a user of Company A?" | Company A's own badge office, which reception phones to confirm |
+| Company SSOs (MasIkea, VodaFundas, CoreCenas) | "Is this really one of *our* people?" | each company's own badge office, which reception phones to confirm |
 | MCP server | "May this person do this action, in this tenant, right now?" | the floor manager who checks the badge against the room list |
 | Assignment store (Postgres) | "Which tenants may this person work in, with which role, until when?" | the room-access list |
 | Token exchange + internal token | "Which one room is this key cut for?" | a key that opens one room for five minutes |
@@ -98,28 +103,30 @@ take it away, and something specific breaks or becomes unsafe.
 
 #### Keycloak, realm `platform` (the authorization server)
 
-- **Job:** the OAuth 2.1 server the AI clients talk to. It lets AI apps register themselves
-  (Dynamic Client Registration), runs the login and the consent screen, and issues a
-  short-lived access token (10 min) that only works for this MCP server. It refreshes that
-  token quietly. It also performs **token exchange**: it swaps a person's token for a
-  5-minute internal token pinned to one tenant.
+- **Job:** CoreCenas' OAuth 2.1 server, the one the AI clients talk to. It lets AI apps
+  register themselves (Dynamic Client Registration), asks for your email and sends you to
+  your company's SSO, shows the consent screen, and issues a short-lived access token
+  (10 min) that only works for this MCP server. It refreshes that token quietly. It also
+  performs **token exchange**: it swaps a person's token for a 5-minute internal token
+  pinned to one tenant.
 - **Why it's there:** MCP clients only connect through the standard MCP OAuth flow
-  (discovery, PKCE, audience-bound tokens). Something has to speak it, and it keeps
-  identities in one place, whatever login system is upstream.
+  (discovery, PKCE, audience-bound tokens). Something has to speak it, and it gives every
+  company's users one issuer and one token format, whatever SSO is behind it.
 - **Without it:** people would paste long-lived API keys into AI tools. Those keys would be
   unscoped, never expire, and couldn't be traced to a person.
 - **Doesn't:** decide which tenants someone may touch. It knows *who* you are, not *where*
   you may go.
 
-#### Keycloak, realm `corp-entra` (mock company SSO)
+#### Company SSO realms (`corecenas-entra`, `masikea-entra`, `vodafundas-okta`)
 
-- **Job:** simulates the single sign-on of one client company, say **Company A**'s
-  Microsoft Entra ID. Its users sign in here with their company account. Realm `platform`
-  doesn't hold their passwords: it forwards the login here ("brokering") and trusts the answer.
-- **Why it's there:** every client company (Company A, Company B, …) brings its own SSO, and
-  its users should log in with the account they already have. Disabling someone at their
-  company should cut their access here too. In a real setup, you'd point an identity
-  provider at each company's actual SSO. See [FAQ 4](#4-why-are-there-two-keycloak-realms-and-what-does-brokering-a-login-mean).
+- **Job:** each one simulates a company's own single sign-on. **MasIkea** signs in with its
+  Microsoft Entra ID, **VodaFundas** with its Okta, and **CoreCenas** staff with CoreCenas'
+  Entra ID. Each realm holds that company's users and passwords. Realm `platform` never
+  does: it forwards the login to the right company ("brokering") and trusts the answer.
+- **Why it's there:** every client company brings its own SSO, and its users should log in
+  with the account they already have. When a company disables someone in its SSO, that
+  person can't sign in to the platform any more. In a real setup, each identity provider in
+  realm `platform` would point at the company's actual SSO. See [FAQ 4](#4-why-are-there-several-keycloak-realms-and-what-does-brokering-a-login-mean).
 - **Doesn't:** talk to the AI clients. They only ever see realm `platform`, one issuer, no
   matter how many companies' SSOs sit behind it.
 
@@ -127,10 +134,11 @@ take it away, and something specific breaks or becomes unsafe.
 
 - **Job:** the decision point. It checks the token again (it must be meant for this server),
   then, for every call: which tenant (from the explicit `tenant_id` argument), whether that
-  tenant belongs to this server's zone, whether the person has an active assignment there,
-  whether their role and scope are high enough, and whether they're under the rate limit.
-  For risky tools it returns a plan and asks for confirmation first. Then it gets a
-  one-tenant token and calls the backend. It writes an audit record for every call.
+  tenant belongs to this server's zone, whether a client company's user is staying inside
+  their own company's tenant, whether the person has an active assignment there, whether
+  their role and scope are high enough, and whether they're under the rate limit. For risky
+  tools it returns a plan and asks for confirmation first. Then it gets a one-tenant token
+  and calls the backend. It writes an audit record for every call.
 - **Why it's there:** it's the only place that knows the person, the tool and the tenant at
   the same time. It also turns many uneven backend routes into a small set of clear,
   task-level tools, each with a risk tier.
@@ -142,8 +150,8 @@ take it away, and something specific breaks or becomes unsafe.
 #### Assignment store (Postgres, `db/init/01-schema.sql`)
 
 - **Job:** the explicit list of who may work in which tenant, with which role, until when,
-  and why. It also holds the tenants and the zone each lives in, the audit log, and the
-  confirmation ids that have been used.
+  and why. It also holds the tenants (with their zone and owning company), the audit log,
+  and the confirmation ids that have been used.
 - **Why it's there:** "may this person work in tenant T?" must be a reviewable fact, not
   something implied by being logged in. Every change to it is logged too
   (`assignment_changes`).
@@ -184,8 +192,8 @@ take it away, and something specific breaks or becomes unsafe.
   which tenant, which tool and risk tier, a hash of the arguments plus a redacted copy, the
   confirmation id, the outcome (allowed, planned, refused and why, error), which backend
   route was called, and how long it took.
-- **Why it's there:** when staff can act across tenants, this record is the evidence that
-  access was legitimate, and the first place to look in an incident.
+- **Why it's there:** when CoreCenas staff can act across client tenants, this record is the
+  evidence that access was legitimate, and the first place to look in an incident.
 - **Doesn't:** store tokens, full personal data or prompt text.
 
 #### Supporting pieces
@@ -194,7 +202,7 @@ take it away, and something specific breaks or becomes unsafe.
 | --- | --- |
 | **etcd** | Stores the gateway config so the APISIX dashboard can list and edit it |
 | **gateway-seed** job (`apisix/seed/`) | Loads `apisix/apisix.yaml` into the gateway and removes anything not in the file, so the file stays the source of truth |
-| **bootstrap** job (`bootstrap/`) | Configures both Keycloak realms (clients, scopes, token lifetimes, registration rules, the Entra broker) and syncs `directory.json` into the assignment store. Safe to re-run |
+| **bootstrap** job (`bootstrap/`) | Configures all Keycloak realms (clients, scopes, token lifetimes, registration rules, one SSO + Organization per company) and syncs `directory.json` into the assignment store. Safe to re-run |
 | **api-docs** (Swagger UI) | Read-only docs for the mock APIs on port 8082 |
 | **cloudflared** | Only with `make tunnel`: gives the gateway a public HTTPS URL so cloud-hosted clients (claude.ai, ChatGPT) can reach it |
 
@@ -215,8 +223,8 @@ want to run the tests or connect Claude Desktop.
 ```bash
 git clone https://github.com/jricardooliveira/mcp-keycloak-apisix.git
 cd mcp-keycloak-apisix
-make up                                      # first start takes 1–2 minutes
-make test                                    # optional: full login + tool calls in a script
+make up          # first start takes 1–2 minutes
+make test        # optional: full login + tool calls in a script, for 4 users
 ```
 
 When `make up` finishes it prints the URLs. Everything listens on `127.0.0.1` only.
@@ -228,13 +236,16 @@ When `make up` finishes it prints the URLs. Everything listens on `127.0.0.1` on
 | APISIX dashboard | http://localhost:9180/ui | gear icon → admin key `local-apisix-admin-key` |
 | Mock API docs (Swagger UI) | http://localhost:8082 | — |
 
-**Demo users** (you'll type these on the "Corporate Entra ID" login page):
+**Demo users.** All passwords are `Passw0rd!`. Type the email on the first login page;
+you're then sent to that company's SSO.
 
-| User | Password | Can do |
+| Email | Company (SSO) | Can do |
 | --- | --- | --- |
-| `alice` | `Passw0rd!` | Supervisor in **1001 Acme Retail**, support operator in **1002 Globex Telecom**. Also assigned to 2001 Initech Bank, but that tenant lives in another zone |
-| `bob` | `Passw0rd!` | Viewer in 1001. His 1002 assignment has **expired** |
-| `carol` | `Passw0rd!` | Can sign in, but has no tenants |
+| `alice@corecenas.example` | CoreCenas staff (CoreCenas Entra ID) | Supervisor in **1001 MasIkea**, support operator in **1002 VodaFundas**. Also assigned to 2001 Initech Bank, but that tenant lives in another zone |
+| `bob@corecenas.example` | CoreCenas staff | Viewer in 1001. His 1002 assignment has **expired** |
+| `carol@corecenas.example` | CoreCenas staff | Can sign in, but has no tenants |
+| `marta@masikea.example` | MasIkea (MasIkea Entra ID) | Supervisor in her own tenant, **1001 MasIkea**, and nowhere else |
+| `vasco@vodafundas.example` | VodaFundas (VodaFundas Okta) | Support operator in **1002 VodaFundas**. He's *also* assigned to 1001 on purpose, to show that a client company's user is still refused outside their own tenant |
 
 Other commands:
 
@@ -250,24 +261,24 @@ make assignments   # who may work in which tenant
 
 ## Connect a client
 
-The first time a client connects, it opens a browser. Keycloak sends you to the mock
-Entra login, you sign in, approve the consent screen, and you're connected. The
-client refreshes its token quietly after that.
+The first time a client connects, it opens a browser. You type your email, Keycloak
+sends you to your company's SSO, you sign in, approve the consent screen, and you're
+connected. The client refreshes its token quietly after that.
 
 ```mermaid
 sequenceDiagram
-  participant U as You
+  participant U as You (marta@masikea.example)
   participant C as AI client
   participant G as APISIX + MCP server
   participant K as Keycloak (platform)
-  participant E as Mock Entra
+  participant E as MasIkea SSO
   C->>G: call /mcp without a token
   G-->>C: 401 + where to log in
   C->>K: register itself (DCR)
   C->>U: open browser
-  U->>K: sign in
-  K->>E: forward to Entra login
-  U->>E: alice / Passw0rd!
+  U->>K: type your email
+  K->>E: @masikea.example → MasIkea's SSO
+  U->>E: password (and MFA)
   E-->>K: identity
   U->>K: approve consent
   K-->>C: access token (10 min) + refresh token
@@ -286,23 +297,24 @@ to be public.
    ```bash
    f=~/Library/Application\ Support/Claude/claude_desktop_config.json
    cp "$f" "$f.bak"
-   jq --arg npx "$(command -v npx)" '.mcpServers.platform = {
+   jq --arg npx "$(command -v npx)" '.mcpServers.corecenas = {
          "command": $npx,
          "args": ["-y", "mcp-remote", "http://localhost:9080/mcp", "--allow-http"]
        }' "$f.bak" > "$f"
    ```
 
    The full path to `npx` matters: Claude Desktop doesn't load your shell's `PATH`.
-3. Open Claude Desktop. A browser tab opens: sign in as `alice`, click **Yes**.
-4. In a new chat, check the tools menu for **platform**, and ask *"What Platform tenants can I work in?"*
+3. Open Claude Desktop. A browser tab opens: type `alice@corecenas.example`, sign in with
+   `Passw0rd!`, click **Yes**.
+4. In a new chat, check the tools menu for **corecenas**, and ask *"Which tenants can I work in?"*
 
 ### Claude Code
 
 ```bash
-make claude        # = claude mcp add --transport http platform http://localhost:9080/mcp
+make claude        # = claude mcp add --transport http corecenas http://localhost:9080/mcp
 ```
 
-Then in Claude Code run `/mcp`, pick **platform**, choose **Authenticate**.
+Then in Claude Code run `/mcp`, pick **corecenas**, choose **Authenticate**.
 
 ### claude.ai, ChatGPT, or a Claude Desktop custom connector
 
@@ -319,7 +331,7 @@ Advanced → Developer mode → Create**). Leave client id and secret empty.
 
 - The tunnel URL is **random and changes every time**. `make tunnel` re-points Keycloak,
   the gateway and the MCP server at it, which signs everyone out.
-- **The login page is public while the tunnel runs.** Change the demo passwords first
+- **The login pages are public while the tunnel runs.** Change the demo passwords first
   (see [Change a password](#change-a-password-or-disable-a-user)).
 - `make local` stops the tunnel and goes back to `http://localhost:9080`.
 
@@ -327,23 +339,27 @@ Advanced → Developer mode → Create**). Leave client id and secret empty.
 
 ## Things to try
 
-Signed in as `alice`:
+Signed in as **alice** (CoreCenas staff):
 
 | Ask | What you'll see |
 | --- | --- |
-| *"What Platform tenants can I work in?"* | Your assignments, roles and zones |
-| *"How are Acme's queues right now?"* | Live stats (mock) |
-| *"Compare the conversion rates of Acme's campaigns."* | Campaign stats |
-| *"Find customer Maria Santos in Acme."* | Personal data: Claude must give a reason, which is audited |
-| *"Create a segment in Acme called High spenders with rule lifetime_value > 8000."* | A **plan** first; it only runs after you confirm |
-| *"Pause the Loyalty NPS survey campaign at Acme."* | Plan, then an explicit yes |
-| *"Send an SMS to +351910000002 from Acme saying the order shipped."* | Plan with a cost estimate |
-| *"Start the 5G upgrade campaign at Globex."* | **Refused**: support operator is below supervisor |
+| *"Which tenants can I work in?"* | Your assignments, roles and zones |
+| *"How are MasIkea's queues right now?"* | Live stats (mock) |
+| *"Compare the conversion rates of MasIkea's campaigns."* | Campaign stats |
+| *"Find customer Maria Santos in MasIkea."* | Personal data: Claude must give a reason, which is audited |
+| *"Create a segment in MasIkea called High spenders with rule lifetime_value > 8000."* | A **plan** first; it only runs after you confirm |
+| *"Pause the Loyalty NPS survey campaign at MasIkea."* | Plan, then an explicit yes |
+| *"Send an SMS to +351910000002 from MasIkea saying the order shipped."* | Plan with a cost estimate |
+| *"Start the 5G upgrade campaign at VodaFundas."* | **Refused**: support operator is below supervisor |
 | *"List campaigns for Initech Bank."* | **Refused**: that tenant is served by zone eu2 |
+
+Signed in as **marta** (MasIkea): *"Show MasIkea's campaigns"* works; *"Show VodaFundas'
+campaigns"* is **refused**: that tenant belongs to another company.
 
 Then run `make audit` to see every call, including the refused ones.
 
-To try another user: quit Claude Desktop, run `rm -rf ~/.mcp-auth`, reopen, sign in as `bob`.
+To switch users in Claude Desktop: quit it, run `rm -rf ~/.mcp-auth`, reopen, and sign
+in with another email.
 
 ---
 
@@ -351,19 +367,20 @@ To try another user: quit Claude Desktop, run `rm -rf ~/.mcp-auth`, reopen, sign
 
 ### Keycloak admin console — http://localhost:8081
 
-Sign in with `admin` / `admin`. Use **Manage realms** (top left) to switch to `platform`.
+Sign in with `admin` / `admin`. Use **Manage realms** (top left) to switch realms.
 
 | In realm `platform` | What you'll find |
 | --- | --- |
 | **Clients** | `platform-mcp-server` (does token exchange), `platform-backend` (audience for portal-api/rest-api), and one client per AI app that registered itself, e.g. *MCP CLI Proxy* = Claude Desktop |
 | **Client scopes** | `platform:read`, `platform:write` (what you consent to), `tenant-<id>` and `role-<role>` (used to build the one-tenant token), `backend-audience` |
-| **Users**, **Sessions** | alice, bob, carol; who is signed in, with which client |
-| **Identity providers** | `entra`, the broker to the mock Entra ID |
-| **Organizations** | *Example Corp*, linked to `entra` |
+| **Users**, **Sessions** | all five people, linked to their company SSO; who is signed in, with which client |
+| **Identity providers** | `corecenas`, `masikea`, `vodafundas`: the brokers to each company's SSO |
+| **Organizations** | *CoreCenas*, *MasIkea*, *VodaFundas*, each with its email domain and linked identity provider (this is what routes the email-first login) |
 | **Events** | logins, token exchanges, app registrations and failed registrations |
 | **Clients → Client registration** | the rules for AI apps registering themselves |
 
-Realm `corp-entra` is the mock company SSO (Company A's Entra ID, say); the demo users' passwords live there.
+The company realms (`corecenas-entra`, `masikea-entra`, `vodafundas-okta`) hold each
+company's users and passwords, as their real SSOs would.
 
 ### APISIX dashboard — http://localhost:9180/ui
 
@@ -373,7 +390,7 @@ limit, …). **Upstreams** shows the MCP server and Keycloak.
 
 ### Mock API docs — http://localhost:8082
 
-Swagger UI for the mocked **rest-api** and **portal-api** APIs: every route, which MCP tool
+Swagger UI for the mocked **rest-api** and **portal-api**: every route, which MCP tool
 calls it, and what the internal token must contain. Read-only: the mocks are only
 reachable from inside Docker, and only with the token the MCP server gets per call.
 
@@ -387,11 +404,11 @@ also be changed in a console. Use this to decide where:
 ```mermaid
 flowchart TD
   Q{"What do you want<br/>to change?"}
-  Q -->|"tenants, staff users,<br/>assignments, allowed client hosts"| D["edit bootstrap/directory.json<br/>then: make bootstrap"]
-  Q -->|"token lifetimes, scopes,<br/>Entra broker settings"| B["edit bootstrap/bootstrap.mjs<br/>then: make bootstrap"]
+  Q -->|"client companies, tenants,<br/>people, assignments, client hosts"| D["edit bootstrap/directory.json<br/>then: make bootstrap"]
+  Q -->|"token lifetimes, scopes,<br/>consent texts"| B["edit bootstrap/bootstrap.mjs<br/>then: make bootstrap"]
   Q -->|"gateway routes,<br/>rate limits"| A["edit apisix/apisix.yaml<br/>then: make gateway-sync"]
   Q -->|"MCP tools,<br/>mock data"| T["edit mcp-server/src/tools.ts<br/>or backend/server.mjs, rebuild"]
-  Q -->|"sessions, consents, passwords,<br/>extra IdPs, organizations"| UI["Keycloak admin console<br/>(kept across restarts)"]
+  Q -->|"sessions, consents,<br/>passwords, disabling users"| UI["Keycloak admin console<br/>(kept across restarts)"]
 ```
 
 **Why this matters:** `make bootstrap` also runs on every `make up` and `make tunnel`.
@@ -402,30 +419,63 @@ overwrites; everything else you change in the Keycloak console is kept.
 | --- | --- |
 | realm `platform` token and session lifetimes, event settings | sessions, consents, events already recorded |
 | client scopes `platform:read`, `platform:write`, `tenant-*`, `role-*`, `backend-audience` (incl. their mappers) | any other client scope you create |
-| clients `platform-mcp-server`, `platform-backend`, `platform-keycloak-broker` | clients that AI apps registered, clients you create |
-| identity provider `entra`, and the automatic redirect to it on the login page | any other identity provider |
+| clients `platform-mcp-server`, `platform-backend`, and each company realm's `platform-keycloak-broker` | clients that AI apps registered, clients you create |
+| the identity provider, Organization and SSO realm of every company in `directory.json` | identity providers and organizations you add by hand |
 | the anonymous client-registration policies | other client policies |
-| name and email of users listed in `directory.json`; their assignments | passwords and enabled/disabled (set only when a user is first created), users not in the file |
+| name, email and company of people in `directory.json`; their assignments | passwords and enabled/disabled (set only when a person is first created), people not in the file |
+
+### Add a client company
+
+Say a new client, **PinguDoce**, signs up and signs in with Google Workspace.
+
+1. In `bootstrap/directory.json`, add the company, its tenant, and at least one person:
+
+   ```json
+   "companies": [
+     ...,
+     { "alias": "pingudoce", "name": "PinguDoce", "domain": "pingudoce.example", "principal_type": "customer_user",
+       "sso": { "realm": "pingudoce-google", "displayName": "PinguDoce Google Workspace (mock)" } }
+   ],
+   "tenants": [
+     ...,
+     { "tenant_id": 1003, "name": "PinguDoce", "zone": "eu1", "company": "pingudoce" }
+   ],
+   "people": [
+     ...,
+     { "username": "paula", "company": "pingudoce", "firstName": "Paula", "lastName": "Pinto",
+       "assignments": [ { "tenant_id": 1003, "role": "supervisor", "expires_at": null, "reason": "PinguDoce admin" } ] }
+   ]
+   ```
+
+2. Run `make bootstrap`. This creates:
+   - the mock SSO realm `pingudoce-google`, with paula and her password
+   - identity provider `pingudoce` and Organization *PinguDoce* (domain `pingudoce.example`)
+     in realm `platform`, so `@pingudoce.example` emails go to PinguDoce's SSO
+   - tenant 1003 in the store, with the `tenant-1003` scope the one-tenant token needs
+   - paula's account, linked to her SSO identity, with her assignment
+3. paula can sign in as `paula@pingudoce.example`.
+
+The gateway needs no change: it allows every realm except `master`. The mock backends
+start a new tenant with empty data. To give it campaigns or customers, add an entry to
+the `data` object in `backend/server.mjs`, then run `docker compose up -d --build rest-api portal-api`.
+
+**Connecting a company's real SSO** instead of a mock realm: the identity provider's
+settings are built in `ensureCompanyIdp()` in `bootstrap/bootstrap.mjs` from the mock
+realm's URLs. For a real SSO you'd give the company its own issuer, client id and secret
+there (for example from extra fields under `sso` in `directory.json`), and register the
+redirect URI `http://…/realms/platform/broker/<alias>/endpoint` with the company's SSO.
 
 ### Add a tenant
 
-1. Add it to `tenants` in `bootstrap/directory.json`:
+Add it to `tenants` in `bootstrap/directory.json`, with the owning company (or `null`
+for a tenant only staff work in), then `make bootstrap`:
 
-   ```json
-   { "tenant_id": 1003, "name": "Umbrella Health", "zone": "eu1" }
-   ```
+```json
+{ "tenant_id": 1004, "name": "Umbrella Health", "zone": "eu1", "company": null }
+```
 
-   The zone must be `eu1` for this MCP server to serve it. Any other zone gets the
-   "served by zone …" refusal.
-2. Run `make bootstrap`. This adds the tenant to the store and creates the
-   `tenant-1003` scope that the one-tenant token needs.
-3. Assign someone to it (next section).
-
-The mock backends start a new tenant with empty data. To give it campaigns,
-customers and so on, add an entry to the `data` object in `backend/server.mjs`, then
-run `docker compose up -d --build rest-api portal-api`.
-
-Tenants are never deleted by the sync, because the audit log refers to them.
+The zone must be `eu1` for this MCP server to serve it. Any other zone gets the "served
+by zone …" refusal. Tenants are never deleted by the sync, because the audit log refers to them.
 
 ### Grant, change or revoke an assignment
 
@@ -433,7 +483,7 @@ Edit the person's `assignments` in `bootstrap/directory.json`, then `make bootst
 
 ```json
 {
-  "username": "bob", "firstName": "Bob", "lastName": "Barros", "groups": ["customer-success"],
+  "username": "bob", "company": "corecenas", "firstName": "Bob", "lastName": "Barros",
   "assignments": [
     { "tenant_id": 1001, "role": "supervisor", "expires_at": "2026-12-31", "reason": "Covering for alice" }
   ]
@@ -444,6 +494,8 @@ Edit the person's `assignments` in `bootstrap/directory.json`, then `make bootst
   Reads need viewer, personal data and simple writes need support_operator, and
   destructive or costly actions need supervisor.
 - **`expires_at`**: a date, or `null` for no expiry. After it passes, calls are refused.
+- **Client company users** can only ever work in their own company's tenant. An assignment
+  to another company's tenant is refused anyway (vasco shows this).
 - For a listed person, the file is complete: an assignment you remove from the file
   is removed from the store. `"assignments": []` revokes everything.
 - Changes reach the MCP server **within 60 seconds** (its decision cache). No new login needed.
@@ -458,22 +510,20 @@ docker compose exec postgres psql -U platform -d platform -c \
    AND subject=(SELECT subject FROM principals WHERE username='bob');"
 ```
 
-### Add a staff user
+### Add a person
 
-1. Add them to `staff` in `bootstrap/directory.json`:
+Add them to `people` in `bootstrap/directory.json`, with their `company`:
 
-   ```json
-   {
-     "username": "dave", "firstName": "Dave", "lastName": "Duarte", "groups": ["customer-success"],
-     "assignments": [ { "tenant_id": 1001, "role": "viewer", "expires_at": null, "reason": "New in customer success" } ]
-   }
-   ```
+```json
+{
+  "username": "dave", "company": "corecenas", "firstName": "Dave", "lastName": "Duarte",
+  "assignments": [ { "tenant_id": 1001, "role": "viewer", "expires_at": null, "reason": "New in customer success" } ]
+}
+```
 
-   Optional fields: `"email"` (default `<username>@example.com`) and `"password"`
-   (default `DEMO_PASSWORD`, i.e. `Passw0rd!`).
-2. Run `make bootstrap`. This creates dave in the mock Entra, creates his linked Platform
-   account, and adds his assignments.
-3. dave can sign in right away.
+Their email becomes `<username>@<company domain>` (here `dave@corecenas.example`). Optional
+fields: `"email"`, `"password"` (default `DEMO_PASSWORD`, i.e. `Passw0rd!`) and `"groups"`.
+Run `make bootstrap`; they can sign in right away.
 
 Removing someone from the file does **not** delete them or their assignments (the
 sync only manages people it lists). To cut access, set `"assignments": []` first and
@@ -481,19 +531,20 @@ run `make bootstrap`, or disable them as described next.
 
 ### Change a password or disable a user
 
-**Password:** Keycloak admin console → realm **corp-entra** → **Users** → the user →
-**Credentials** → **Reset password** (turn *Temporary* off). This is kept across
-restarts. To change the default for new users, set `DEMO_PASSWORD=...` in `.env`
-before they're first created, or run `make reset` to recreate everyone.
+**Password:** Keycloak admin console → the person's **company realm** (for example
+`masikea-entra`) → **Users** → the user → **Credentials** → **Reset password** (turn
+*Temporary* off). This is kept across restarts. To change the default for new users, set
+`DEMO_PASSWORD=...` in `.env` before they're first created, or run `make reset` to
+recreate everyone.
 
-**Disable someone** (offboarding): turn **Enabled** off for the user in **both** realms.
+**Disable someone** (offboarding): turn **Enabled** off for the user in **both** places.
 
-- Realm **corp-entra** (like their company disabling them in its SSO): stops new logins.
+- Their **company realm** (like their company disabling them in its SSO): stops new logins.
 - Realm **platform**: stops their existing connection too. Their AI client's next token
   refresh fails with *User disabled*, so access ends within 10 minutes (the access
   token lifetime).
 
-Disabling in corp-entra alone doesn't end a session that already exists: Keycloak
+Disabling in the company realm alone doesn't end a session that already exists: Keycloak
 doesn't recheck the upstream login when a client refreshes its token. Both settings
 survive `make bootstrap`.
 
@@ -541,31 +592,12 @@ These are in `bootstrap/bootstrap.mjs`, function `configurePlatform`:
 
 Run `make bootstrap` after editing.
 
-### Add another identity provider (e.g. a customer's own login)
-
-Use this when a tenant brings its own identity provider.
-
-1. Realm `platform` → **Identity providers** → **Add provider → OpenID Connect**. Enter the
-   provider's discovery URL, client id and secret, and note the **Redirect URI** Keycloak
-   shows you (the provider must allow it).
-2. Realm `platform` → **Organizations** → **Create organization** for the tenant, add the
-   customer's email domain, and on its **Identity providers** tab link the new provider.
-3. Staff are sent straight to Entra today, so nobody sees a provider choice. To get the
-   email-first page that picks the provider by domain, delete the *"Skip the login form"*
-   block in `bootstrap/bootstrap.mjs` (it sets `defaultProvider: "entra"`) and run
-   `make bootstrap`. Then in **Authentication → browser**, open the settings of the
-   *Identity Provider Redirector* step and delete that configuration.
-
-Keycloak keeps these, since bootstrap only manages `entra`. People who sign in this
-way can log in, but the MCP server refuses every tool until they have an assignment.
-Add a `principals` row with their `platform` user id (shown under **Users**) and an
-assignment, via SQL.
-
 ### Look at events
 
 Realm `platform` → **Events** → **User events** (`LOGIN`, `CODE_TO_TOKEN`, `TOKEN_EXCHANGE`,
-`CLIENT_REGISTER`, `CLIENT_REGISTER_ERROR`, …) and **Admin events** (configuration changes). Events are
-kept 90 days. To record more event types: **Realm settings → Events → User events settings**.
+`CLIENT_REGISTER`, `CLIENT_REGISTER_ERROR`, …) and **Admin events** (configuration changes).
+Events are kept 90 days. To record more event types: **Realm settings → Events → User
+events settings**.
 
 ### Change a gateway route or rate limit
 
@@ -605,11 +637,13 @@ input for you.
 flowchart TD
   A["tool call + token"] --> G{"APISIX:<br/>token valid for this server?"}
   G -- no --> X1["401: log in again"]
-  G -- yes --> T{"tenant in this zone<br/>and assigned to you?"}
-  T -- no --> X2["refused + audited"]
-  T -- yes --> R{"role and scope<br/>high enough?"}
-  R -- no --> X2
-  R -- yes --> L{"under the<br/>rate limit?"}
+  G -- yes --> Z{"tenant in this zone?"}
+  Z -- no --> X2["refused + audited"]
+  Z -- yes --> H{"client company user:<br/>own company's tenant?"}
+  H -- no --> X2
+  H -- yes --> T{"active assignment,<br/>role and scope high enough?"}
+  T -- no --> X2
+  T -- yes --> L{"under the<br/>rate limit?"}
   L -- no --> X2
   L -- yes --> P{"write tool<br/>(T2 / T3)?"}
   P -- "yes, no confirmation" --> PL["return a plan<br/>+ confirmation id"]
@@ -620,8 +654,9 @@ flowchart TD
 1. **APISIX** checks the token's signature, issuer and audience (it must be meant for
    this MCP server) before the request goes any further.
 2. **The MCP server** checks the token again, then, for this exact call: the tenant from
-   the `tenant_id` argument, that the tenant belongs to zone `eu1`, an active
-   assignment, the role, the scope, and the rate limit per (person, tenant, tier).
+   the `tenant_id` argument; that the tenant belongs to zone `eu1`; for a client company's
+   user, that the tenant is their own company's (from the token's `company` claim); an
+   active assignment; the role; the scope; and the rate limit per (person, tenant, tier).
 3. **Write tools** return a plan first. The plan comes with a confirmation id that is
    signed, single-use, valid for 5 minutes, and tied to the same person, tenant, tool and
    arguments. The action only runs when the tool is called again with that id.
@@ -639,7 +674,7 @@ flowchart TD
 | Issued to | the AI client, after you sign in | the MCP server, by token exchange |
 | Audience | `http://localhost:9080/mcp` | `platform-backend` |
 | Lifetime | 10 min (refreshed quietly) | 5 min |
-| Carries | who you are, `platform:read` / `platform:write` | who you are, `tenant_id`, `role`, `act: platform-mcp-server` |
+| Carries | who you are, `principal_type`, `company`, `platform:read` / `platform:write` | who you are, `tenant_id`, `role`, `act: platform-mcp-server` |
 | Used by | APISIX and the MCP server | portal-api and rest-api |
 
 ### Tools and risk tiers
@@ -660,14 +695,14 @@ returns `403 insufficient_scope` (`make test-readonly` shows this).
 docker-compose.yml     all services
 Makefile               the commands in this README
 bootstrap/
-  directory.json       tenants, staff users, assignments, allowed client hosts   ← edit this
+  directory.json       companies + SSOs, tenants, people, assignments, client hosts  ← edit this
   bootstrap.mjs        Keycloak config as code + sync of directory.json
 apisix/
-  apisix.yaml          gateway routes and plugins                                ← and this
+  apisix.yaml          gateway routes and plugins                                     ← and this
   config.yaml          gateway process settings (etcd, admin key)
   seed/                loads apisix.yaml into the gateway (make gateway-sync)
 mcp-server/src/
-  tools.ts             tool catalogue                                            ← and this
+  tools.ts             tool catalogue                                                 ← and this
   server.ts            HTTP, 401 challenge, per-call authorization
   auth.ts store.ts guards.ts backend.ts config.ts
 backend/server.mjs     mock portal-api + rest-api, incl. their data
@@ -681,8 +716,9 @@ tests/e2e.mjs          scripted client: register, log in, call tools
 
 ## FAQ
 
-Questions a developer new to this stack usually asks, with the answers and where to
-look in the code.
+Questions a developer new to this stack usually asks, with the answers, where to look in
+the code, and **real payloads** captured from this lab (open the *Example* blocks). In
+the examples, tokens are shortened to `eyJ…` and ids are from one run; yours will differ.
 
 ### 1. When Claude first connects to `/mcp`, how does it find out where to log in?
 
@@ -690,11 +726,9 @@ It follows a chain of standard discovery documents. Nothing is configured in the
 except the MCP URL.
 
 1. Claude calls `POST /mcp` without a token. The MCP server answers **401** with a header
-   that says where to look next:
-   `WWW-Authenticate: Bearer resource_metadata="…/.well-known/oauth-protected-resource/mcp", scope="platform:read platform:write offline_access"`.
+   that says where to look next.
 2. Claude fetches that **Protected Resource Metadata** (RFC 9728). It names this server
-   (`resource: http://localhost:9080/mcp`) and its authorization server
-   (`authorization_servers: [".../realms/platform"]`).
+   and its authorization server.
 3. Claude fetches the **authorization server metadata** (RFC 8414) from Keycloak. It learns the
    login, token and registration endpoints, and that PKCE S256 is supported. APISIX maps the
    RFC 8414 URL shape onto Keycloak's layout (routes `as-metadata-*`).
@@ -703,6 +737,51 @@ except the MCP URL.
 
 The 401 is what starts the whole flow; without it the client has no way to discover the
 login. Code: `authenticate()` and the `prm` object in `mcp-server/src/server.ts`.
+
+<details>
+<summary><b>Example:</b> the 401, the resource metadata, the authorization server metadata</summary>
+
+```http
+POST /mcp HTTP/1.1
+Host: localhost:9080
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
+```
+
+```http
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer resource_metadata="http://localhost:9080/.well-known/oauth-protected-resource/mcp", scope="platform:read platform:write offline_access"
+
+{"error":"unauthorized","error_description":"Bearer token required"}
+```
+
+`GET /.well-known/oauth-protected-resource/mcp`:
+
+```json
+{
+  "resource": "http://localhost:9080/mcp",
+  "authorization_servers": ["http://localhost:9080/realms/platform"],
+  "scopes_supported": ["platform:read", "platform:write", "offline_access"],
+  "bearer_methods_supported": ["header"],
+  "resource_name": "CoreCenas Contact Center (eu1)"
+}
+```
+
+`GET /.well-known/oauth-authorization-server/realms/platform` (excerpt):
+
+```json
+{
+  "issuer": "http://localhost:9080/realms/platform",
+  "authorization_endpoint": "http://localhost:9080/realms/platform/protocol/openid-connect/auth",
+  "token_endpoint": "http://localhost:9080/realms/platform/protocol/openid-connect/token",
+  "registration_endpoint": "http://localhost:9080/realms/platform/clients-registrations/openid-connect",
+  "code_challenge_methods_supported": ["plain", "S256"],
+  "authorization_response_iss_parameter_supported": true
+}
+```
+
+</details>
 
 ### 2. Why does the MCP server reject a valid Keycloak token that was issued for another app?
 
@@ -719,12 +798,68 @@ too: the MCP server must never forward a token it received to another service (s
 Keycloak puts the audience in through mappers on the `platform:read` / `platform:write` scopes
 (its workaround for RFC 8707 Resource Indicators).
 
+<details>
+<summary><b>Example:</b> the token request, the token, and a rejected token</summary>
+
+Token request, after the login redirected back with a code:
+
+```http
+POST /realms/platform/protocol/openid-connect/token HTTP/1.1
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=authorization_code
+&code=6af13ccc-de47-c1b7-7963-d82a843097f8.ufwlQ3Jk…
+&redirect_uri=http://localhost:33418/callback
+&client_id=216a574b-edd5-4579-a33d-7a343329b994
+&code_verifier=XC5T0UXNmHiOqBt5BDq5sG37tplGgPHVEIG0WP5T9h8
+&resource=http://localhost:9080/mcp
+```
+
+```json
+{
+  "access_token": "eyJ…",
+  "expires_in": 600,
+  "refresh_token": "eyJ…",
+  "token_type": "Bearer",
+  "scope": "platform:read offline_access platform:write"
+}
+```
+
+The access token, decoded. Note the two audiences: this MCP server, and the MCP server's
+own Keycloak client (needed for token exchange, question 5):
+
+```json
+{
+  "iss": "http://localhost:9080/realms/platform",
+  "aud": ["platform-mcp-server", "http://localhost:9080/mcp"],
+  "sub": "de4a1552-3ccc-4765-be99-e8ce1667e86f",
+  "azp": "216a574b-edd5-4579-a33d-7a343329b994",
+  "scope": "platform:read offline_access platform:write",
+  "name": "Alice Almeida",
+  "email": "alice@corecenas.example",
+  "principal_type": "staff",
+  "company": "corecenas",
+  "iat": 1790277724,
+  "exp": 1790278324
+}
+```
+
+A token that isn't valid for this server is stopped at the gateway, with a challenge
+that tells the client to log in again:
+
+```http
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer error="invalid_token", resource_metadata="http://localhost:9080/.well-known/oauth-protected-resource/mcp", scope="platform:read platform:write offline_access"
+```
+
+</details>
+
 ### 3. What is Dynamic Client Registration, and what stops anyone from registering a malicious client?
 
 **Dynamic Client Registration (DCR)** lets an app register itself as an OAuth client with
 one HTTP call, instead of an admin creating it by hand. Claude and ChatGPT need it because
-every user connects their own client instance to arbitrary MCP servers; nobody could pre-create
-all of those in Keycloak.
+every user connects their own client instance to arbitrary MCP servers; nobody could
+pre-create all of those in Keycloak.
 
 Anyone can call the registration endpoint, so it's restricted by several layers:
 
@@ -743,52 +878,145 @@ Anyone can call the registration endpoint, so it's restricted by several layers:
 What it doesn't stop: an app on an allowed host (such as `localhost`) registering under a
 misleading name. The consent screen and the audit log are the controls there.
 
-### 4. Why are there two Keycloak realms, and what does "brokering" a login mean?
+<details>
+<summary><b>Example:</b> an accepted and a rejected registration</summary>
 
-**Realm `corp-entra` simulates an external single sign-on (SSO) system**, the identity
-provider of one of our client companies. In real life every client company brings its own:
-**Company A** signs in with its Microsoft Entra ID, **Company B** with its Okta, Company C with
-Google, and so on. Their users should log in with their own company account, and the
-platform should never store their passwords. In the lab, `corp-entra` plays one of those
-companies. It holds the demo users and their passwords, exactly as Company A's Entra would.
+```http
+POST /realms/platform/clients-registrations/openid-connect HTTP/1.1
+Content-Type: application/json
 
-**Realm `platform`** is our own authorization server. It's the only one the AI clients ever
-talk to, whatever company the user belongs to. When it needs to log someone in, it doesn't
-check a password itself; it **brokers** the login to that company's SSO:
+{
+  "client_name": "Claude",
+  "redirect_uris": ["http://localhost:33418/callback"],
+  "grant_types": ["authorization_code", "refresh_token"],
+  "response_types": ["code"],
+  "token_endpoint_auth_method": "none",
+  "scope": "platform:read platform:write offline_access"
+}
+```
+
+```http
+HTTP/1.1 201 Created
+
+{
+  "client_id": "216a574b-edd5-4579-a33d-7a343329b994",
+  "client_name": "Claude",
+  "redirect_uris": ["http://localhost:33418/callback"],
+  "token_endpoint_auth_method": "none",
+  "grant_types": ["authorization_code", "refresh_token"],
+  "scope": "offline_access platform:read platform:write",
+  "registration_client_uri": "http://localhost:9080/realms/platform/clients-registrations/openid-connect/216a574b-…",
+  "registration_access_token": "eyJ…"
+}
+```
+
+The same request with `"redirect_uris": ["https://evil.example/callback"]`:
+
+```http
+HTTP/1.1 403 Forbidden
+
+{
+  "error": "insufficient_scope",
+  "error_description": "Policy 'Trusted Hosts' rejected request to client-registration service. Details: URI doesn't match any trusted host or trusted domain"
+}
+```
+
+</details>
+
+### 4. Why are there several Keycloak realms, and what does "brokering" a login mean?
+
+**Each company SSO realm simulates the single sign-on of one company.** CoreCenas' client
+companies bring their own: **MasIkea** signs in with its Microsoft Entra ID (realm
+`masikea-entra`), **VodaFundas** with its Okta (realm `vodafundas-okta`), and CoreCenas' own
+staff use CoreCenas' Entra ID (realm `corecenas-entra`). Their users log in with their own
+company account, and CoreCenas never stores their passwords. In the lab, each of those realms
+plays that company's SSO: it holds the company's users and passwords, exactly as the real
+one would.
+
+**Realm `platform`** is CoreCenas' authorization server. It's the only one the AI clients ever
+talk to, whatever company the user belongs to. When it needs to log someone in, it asks for
+their email, picks the company from the email's domain, and **brokers** the login to that
+company's SSO:
 
 ```mermaid
 sequenceDiagram
-  participant U as User (Company A)
+  participant U as marta@masikea.example
   participant P as Keycloak "platform"
-  participant A as Company A SSO (corp-entra)
+  participant A as MasIkea SSO (masikea-entra)
   U->>P: log in (started by the AI client)
-  P->>U: redirect to Company A's SSO
-  U->>A: username + password (and MFA)
+  P->>U: "what's your email?"
+  U->>P: marta@masikea.example
+  P->>U: domain masikea.example → redirect to MasIkea's SSO
+  U->>A: password (and MFA)
   A->>P: authorization code
   P->>A: exchange code for an id_token (server to server)
-  P->>P: verify signature, find the linked user, add claims
+  P->>P: verify signature, find marta's linked account, add claims
   P-->>U: platform's own tokens for the AI client
 ```
+
+What routes the email is a **Keycloak Organization** per company: it owns the company's
+email domain and is linked to the company's identity provider in realm `platform`.
 
 Why broker instead of letting the AI client talk to each company's SSO directly:
 
 - **One issuer:** Claude and ChatGPT know one authorization server, one token format and one
-  client registration, however many client companies we add.
-- **Company-specific rules stay in one place:** each company's groups can be mapped to our
-  roles with Keycloak mappers, per identity provider.
-- **Offboarding follows the company:** when Company A disables someone in its SSO, they can't
+  client registration, however many client companies CoreCenas adds.
+- **Company-specific rules stay in one place:** each company's groups can be mapped to
+  platform roles with Keycloak mappers, per identity provider.
+- **The company is known for sure:** the token's `company` claim is set by which SSO the person
+  signed in with, never by anything the client sends. The MCP server uses it to keep a client
+  company's users inside their own tenant, even if someone assigned them elsewhere by mistake.
+- **Offboarding follows the company:** when MasIkea disables someone in its SSO, they can't
   sign in to the platform any more (see question 10 for existing sessions).
 
-**Adding Company B** means one more identity provider in realm `platform`, plus one
-**Organization** per company. The Organization holds the company's email domains and is
-linked to its identity provider, so Keycloak can send `@company-b.com` users to Company B's
-SSO automatically. See [Add another identity provider](#add-another-identity-provider-eg-a-customers-own-login).
-To simulate Company B locally, you can create a second realm (for example `company-b`) the
-same way `corp-entra` is set up, and add it as a second identity provider.
+To add a company, see [Add a client company](#add-a-client-company): one entry in
+`directory.json` and `make bootstrap`.
 
-In the lab, the one company SSO is wired as the default, so the login page jumps straight to
-it (`defaultProvider: "entra"` in `bootstrap.mjs`). The code calls it `entra` because Entra ID
-is the most common case. Brokering is the same whoever is upstream.
+<details>
+<summary><b>Example:</b> the email-first redirect, marta's token, and the home-tenant check</summary>
+
+After marta types her email, Keycloak redirects to MasIkea's broker, passing her email
+along as a login hint:
+
+```
+http://localhost:9080/realms/platform/broker/masikea/login?session_code=Go5uAe6E…&client_id=6db18e02-…&login_hint=marta%40masikea.example
+```
+
+…which forwards to MasIkea's SSO (the `masikea-entra` realm), where she types her password.
+After the round trip, her access token from realm `platform` (decoded):
+
+```json
+{
+  "iss": "http://localhost:9080/realms/platform",
+  "aud": ["platform-mcp-server", "http://localhost:9080/mcp"],
+  "sub": "4d9425b7-d6f9-4186-89b7-59f0d5eec7b0",
+  "scope": "platform:read offline_access platform:write",
+  "name": "Marta Moura",
+  "email": "marta@masikea.example",
+  "principal_type": "customer_user",
+  "company": "masikea"
+}
+```
+
+marta asks for her own tenant, then for VodaFundas':
+
+```json
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_campaigns","arguments":{"tenant_id":1001}}}
+```
+
+```json
+{"result":{"content":[{"type":"text","text":"[{\"id\":501,\"name\":\"Black Friday reactivation\",\"status\":\"running\",\"type\":\"outbound-voice\"},{\"id\":502,\"name\":\"Loyalty NPS survey\",…}]"}]},"jsonrpc":"2.0","id":3}
+```
+
+```json
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_campaigns","arguments":{"tenant_id":1002}}}
+```
+
+```json
+{"result":{"content":[{"type":"text","text":"Denied: tenant 1002 (VodaFundas) belongs to another company; you can only work in your own company's tenant"}],"isError":true},"jsonrpc":"2.0","id":4}
+```
+
+</details>
 
 ### 5. What is token exchange, and why doesn't the MCP server just forward the user's token?
 
@@ -816,6 +1044,82 @@ The MCP server caches each internal token per (person, tenant, role) until 30 se
 it expires, and never reuses one across tenants. Code: `internalToken()` in
 `mcp-server/src/backend.ts`; the token check in `backend/server.mjs`.
 
+<details>
+<summary><b>Example:</b> the exchange, the internal token, and the backend's answers</summary>
+
+What the MCP server sends to Keycloak (inside the Docker network):
+
+```http
+POST /realms/platform/protocol/openid-connect/token HTTP/1.1
+Host: keycloak:8080
+Authorization: Basic cGxhdGZvcm0tbWNwLXNlcnZlcjo…   (platform-mcp-server + its secret)
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=urn:ietf:params:oauth:grant-type:token-exchange
+&subject_token=eyJ…   (alice's access token)
+&subject_token_type=urn:ietf:params:oauth:token-type:access_token
+&requested_token_type=urn:ietf:params:oauth:token-type:access_token
+&scope=tenant-1001 role-supervisor
+```
+
+```json
+{
+  "access_token": "eyJ…",
+  "expires_in": 300,
+  "token_type": "Bearer",
+  "scope": "tenant-1001 role-supervisor",
+  "issued_token_type": "urn:ietf:params:oauth:token-type:access_token"
+}
+```
+
+The internal token, decoded:
+
+```json
+{
+  "iss": "http://localhost:9080/realms/platform",
+  "aud": "platform-backend",
+  "sub": "de4a1552-3ccc-4765-be99-e8ce1667e86f",
+  "azp": "platform-mcp-server",
+  "scope": "tenant-1001 role-supervisor",
+  "tenant_id": 1001,
+  "role": "supervisor",
+  "act": { "sub": "platform-mcp-server" },
+  "iat": 1790277724,
+  "exp": 1790278024
+}
+```
+
+The MCP server then calls the backend with it:
+
+```http
+GET /campaign HTTP/1.1
+Host: portal-api:4000
+Authorization: Bearer eyJ…   (the internal token)
+```
+
+```http
+HTTP/1.1 200 OK
+
+[{"id":501,"name":"Black Friday reactivation","status":"running","type":"outbound-voice"},
+ {"id":502,"name":"Loyalty NPS survey","status":"paused","type":"sms"}]
+```
+
+The same call with alice's *own* access token, and with no token:
+
+```http
+HTTP/1.1 401 Unauthorized
+
+{"error":"invalid internal token: unexpected \"aud\" claim value"}
+```
+
+```http
+HTTP/1.1 401 Unauthorized
+
+{"error":"missing internal token"}
+```
+
+</details>
+
 ### 6. If the MCP server validates the token, why does APISIX validate it too? And why not let the gateway inject a trusted `X-Tenant-ID` header?
 
 **Each check guards against a different failure.** APISIX checks cheaply at the edge, so
@@ -829,6 +1133,26 @@ backends believed `X-Tenant-ID`, then anything that can reach them from inside (
 misrouted request, a compromised container, a bug) could name any tenant by setting a header.
 A signed internal token can't be forged that way. APISIX actively **strips** such headers
 from incoming requests (`proxy-rewrite` in the `edge` plugin config), so nobody can try.
+
+<details>
+<summary><b>Example:</b> the three checks, as they answer</summary>
+
+| Check | Request | Answer |
+| --- | --- | --- |
+| APISIX | forged token on `/mcp` | `401` + `WWW-Authenticate: Bearer error="invalid_token", resource_metadata="…"` |
+| MCP server | tenant in another zone | `Denied: tenant 2001 (Initech Bank) is served by zone eu2; use the mcpeu2 server` |
+| Backend | user's own token instead of the internal one | `401 {"error":"invalid internal token: unexpected \"aud\" claim value"}` |
+
+The stripped headers (`apisix/apisix.yaml`, plugin config `edge`):
+
+```yaml
+proxy-rewrite:
+  headers:
+    remove: [X-Tenant-ID, X-Company, X-User, X-User-Id, X-Userinfo, X-Access-Token,
+             X-ID-Token, X-Forwarded-User, X-Remote-User, X-Auth-Request-User]
+```
+
+</details>
 
 ### 7. Why are there two `/mcp` routes in APISIX, and what does `response-rewrite` fix?
 
@@ -847,6 +1171,32 @@ that header on its own.
 Both routes still get the rate limit and size limit. See `apisix/apisix.yaml`, or the
 **Routes** page in the APISIX dashboard.
 
+<details>
+<summary><b>Example:</b> the same URL, with and without a token</summary>
+
+No token → forwarded to the MCP server, which starts the login:
+
+```http
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer resource_metadata="http://localhost:9080/.well-known/oauth-protected-resource/mcp", scope="platform:read platform:write offline_access"
+```
+
+Bad token → stopped by APISIX; `response-rewrite` adds `error="invalid_token"` and the
+metadata pointer:
+
+```http
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer error="invalid_token", resource_metadata="http://localhost:9080/.well-known/oauth-protected-resource/mcp", scope="platform:read platform:write offline_access"
+```
+
+The matching rule on `mcp-authenticated`:
+
+```yaml
+vars: [["http_authorization", "~*", "^bearer "]]
+```
+
+</details>
+
 ### 8. Why isn't the list of tenants a person may use stored in the token?
 
 Because tokens are **snapshots**: whatever is inside stays true until the token expires.
@@ -854,16 +1204,56 @@ Because tokens are **snapshots**: whatever is inside stays true until the token 
 - **Stale access:** if the tenant list were in the token, removing an assignment wouldn't take
   effect until the token expired. Refresh tokens can live much longer.
 - **Size:** staff can have many assignments, and tokens travel on every request.
-- **Separation of concerns:** Keycloak knows *who* you are; the assignment store knows *where*
-  you may go, with which role, until when, and who approved it.
+- **Separation of concerns:** Keycloak knows *who* you are (and which company you belong to);
+  the assignment store knows *where* you may go, with which role, until when, and who
+  approved it.
 
-So the token carries only stable, coarse facts (who, which app, `platform:read` /
-`platform:write`), and the MCP server looks up the assignment on **every call**. Lookups are
-cached for 60 seconds per (person, tenant), so an assignment change takes effect within
-a minute.
+So the token carries only stable, coarse facts (who, which company, which app,
+`platform:read` / `platform:write`), and the MCP server looks up the assignment on **every
+call**. Lookups are cached for 60 seconds per (person, tenant), so an assignment change
+takes effect within a minute.
 
 The trade-off: one database lookup per call (mostly served from the cache), and the MCP
 server depends on the store being available. Code: `getAssignment()` in `mcp-server/src/store.ts`.
+
+<details>
+<summary><b>Example:</b> the token's scopes decide which tools exist; the store decides where</summary>
+
+`tools/list` for a full token returns 17 tools. One of them, as the client sees it:
+
+```json
+{
+  "name": "start_campaign",
+  "title": "Start campaign",
+  "description": "Start (or resume) a campaign; it will contact real customers. Two steps: plan, then execute with confirmation_id after the user explicitly agrees. [risk tier T3]",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "tenant_id": { "type": "integer", "exclusiveMinimum": 0, "description": "Tenant id; see get_my_context" },
+      "campaign_id": { "type": "integer", "exclusiveMinimum": 0 },
+      "confirmation_id": { "type": "string", "description": "Omit on the first call; pass the id returned by the plan to execute" }
+    },
+    "required": ["tenant_id", "campaign_id"]
+  },
+  "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true }
+}
+```
+
+With a `platform:read`-only token, write tools aren't listed, and calling one anyway is
+refused at the HTTP level (step-up):
+
+```http
+HTTP/1.1 403 Forbidden
+WWW-Authenticate: Bearer resource_metadata="http://localhost:9080/.well-known/oauth-protected-resource/mcp", scope="platform:read platform:write", error="insufficient_scope", error_description="start_campaign needs platform:write"
+```
+
+A valid token but no active assignment (bob's expired one):
+
+```text
+Denied: no active assignment to tenant 1002
+```
+
+</details>
 
 ### 9. How does plan → execute work, and what stops the AI from reusing a confirmation?
 
@@ -876,9 +1266,11 @@ Tools that change data (tiers T2 and T3) run in two steps:
 
 The `confirmation_id` is built so it can't be reused:
 
-- **Signed** with HMAC using a key only the MCP server has, so it can't be forged.
+- **Signed** with HMAC using a key only the MCP server has, so it can't be forged. It's
+  *not* encrypted: anyone can read what's inside (see the example), but changing it breaks
+  the signature.
 - **Bound** to the person, the tenant, the tool and a hash of the arguments. Changing
-  campaign 501 to 502 fails with *"arguments changed since the plan"*.
+  campaign 502 to 501 fails with *"arguments changed since the plan"*.
 - **Expires** after 5 minutes.
 - **Single use:** its id is recorded in Postgres (`confirmations_used`) on execute, so a
   replay fails with *"already used"*, even across several MCP server copies.
@@ -888,6 +1280,71 @@ right after the plan. T3 plans instruct the AI to restate the plan and get an ex
 and every plan and execute is audited. A client that supports MCP *elicitation* could put a
 real confirmation dialog in front of the user; the lab doesn't use that yet. Code:
 `issueConfirmation()` / `verifyConfirmation()` in `mcp-server/src/guards.ts`.
+
+<details>
+<summary><b>Example:</b> plan, a changed execute, the real execute, a replay, and the audit trail</summary>
+
+1 — Plan (alice, pausing campaign 502 in MasIkea):
+
+```json
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"pause_campaign","arguments":{"tenant_id":1001,"campaign_id":502}}}
+```
+
+```json
+{
+  "status": "confirmation_required",
+  "tenant": "MasIkea (tenant 1001)",
+  "summary": "Pause campaign 502 in MasIkea",
+  "effect": "Stops new contact attempts until started again.",
+  "count": 1,
+  "confirmation_id": "eyJqdGkiOiIyMjAzMmJiZi00NmNmLTRmODYt….k0TJyTH20AdRkdpJvGudeN3DPtUimriXUojsw8WcBlQ",
+  "expires_at": "2026-09-24T19:27:04.279Z",
+  "next_step": "Restate this plan to the user in your own words and get their explicit yes. Then call pause_campaign again with exactly the same arguments plus confirmation_id."
+}
+```
+
+The part of the `confirmation_id` before the dot, base64-decoded. After the dot is the
+HMAC signature:
+
+```json
+{
+  "jti": "22032bbf-46cf-4f86-92a9-6571b34a1164",
+  "sub": "de4a1552-3ccc-4765-be99-e8ce1667e86f",
+  "w": 1001,
+  "tool": "pause_campaign",
+  "h": "9e629ffd08e6c4bb83d7d171cffc79d16196dc41e4b92fd20a2ff1749a606750",
+  "exp": 1790278024279
+}
+```
+
+2 — Execute with a different campaign (`"campaign_id": 501` + the same `confirmation_id`):
+
+```text
+Denied: arguments changed since the plan; request a new plan
+```
+
+3 — Execute with the planned arguments:
+
+```json
+{ "id": 502, "previous": "running", "status": "paused" }
+```
+
+4 — The same execute again:
+
+```text
+Denied: confirmation_id already used
+```
+
+The four audit rows (`make audit`, newest first; confirmation ids are stored as a short prefix):
+
+| ts | email | tenant | tool | tier | args | outcome | reason | backend route |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 19:22:04.292 | alice@corecenas.example | 1001 | pause_campaign | T3 | campaign 502 | denied | confirmation_id already used | — |
+| 19:22:04.288 | alice@corecenas.example | 1001 | pause_campaign | T3 | campaign 502 | allowed | — | portal-api POST /campaign/502/pause |
+| 19:22:04.283 | alice@corecenas.example | 1001 | pause_campaign | T3 | campaign 501 | denied | arguments changed since the plan | — |
+| 19:22:04.279 | alice@corecenas.example | 1001 | pause_campaign | T3 | campaign 502 | planned | — | — |
+
+</details>
 
 ### 10. If I revoke someone's access, how long until it takes effect?
 
@@ -900,11 +1357,52 @@ that was already issued keeps working until it expires, at most **10 minutes**.
 | Remove or expire an **assignment** | **Within 60 s** for that tenant (assignment cache). Fastest way to cut tenant access | `directory.json` + `make bootstrap` |
 | **Revoke consent** for the app | Refresh and offline tokens stop working now; the current access token works for up to 10 min | Keycloak → Users → user → Consents |
 | **Disable the user** in realm `platform` | Next refresh fails (*User disabled*); up to 10 min | Keycloak → Users |
-| **Disable the user** in the company SSO (`corp-entra`) only | Blocks new logins, but **not** an existing session: Keycloak doesn't recheck the upstream on refresh | Keycloak realm `corp-entra` |
+| **Disable the user** in their company's SSO realm only | Blocks new logins, but **not** an existing session: Keycloak doesn't recheck the upstream on refresh | Keycloak, the company realm |
 
 For a complete offboarding: remove the assignments (cuts tenant access within a minute), then
-disable the user in realm `platform` and in the company SSO. To shrink the 10-minute window,
-lower `accessTokenLifespan` in `bootstrap/bootstrap.mjs`. The trade-off is more frequent refreshes.
+disable the user in realm `platform` and in their company's SSO. To shrink the 10-minute
+window, lower `accessTokenLifespan` in `bootstrap/bootstrap.mjs`. The trade-off is more
+frequent refreshes.
+
+<details>
+<summary><b>Example:</b> refresh token rotation and what a cut-off client sees</summary>
+
+A refresh returns a new access token *and* a new refresh token:
+
+```http
+POST /realms/platform/protocol/openid-connect/token HTTP/1.1
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=refresh_token&refresh_token=eyJ…&client_id=216a574b-edd5-4579-a33d-7a343329b994
+```
+
+```json
+{
+  "access_token": "eyJ…",
+  "expires_in": 600,
+  "refresh_token": "eyJ…",
+  "token_type": "Bearer",
+  "scope": "platform:read offline_access platform:write"
+}
+```
+
+Using the *old* refresh token again (rotation: each one works once):
+
+```http
+HTTP/1.1 400 Bad Request
+
+{"error":"invalid_grant","error_description":"Maximum allowed refresh token reuse exceeded"}
+```
+
+Refreshing after the user was disabled in realm `platform`:
+
+```http
+HTTP/1.1 400 Bad Request
+
+{"error":"invalid_grant","error_description":"User disabled"}
+```
+
+</details>
 
 ---
 
@@ -915,18 +1413,20 @@ lower `accessTokenLifespan` in `bootstrap/bootstrap.mjs`. The trade-off is more 
 | Claude Desktop: server disconnected, log shows `SyntaxError: Unexpected end of input` in `mcp-remote` | The `npx` download got corrupted (two starts raced). Quit Claude Desktop, run `rm -rf ~/.npm/_npx`, then `npx -y mcp-remote --help` once, then reopen |
 | `Policy 'Trusted Hosts' rejected request` | Add the host to `dcrTrustedHosts` ([details](#allow-a-new-ai-client-to-register)) |
 | Claude Desktop keeps failing after a `make reset` or `make tunnel` | The bridge is reusing a registration Keycloak no longer knows. Quit, `rm -rf ~/.mcp-auth`, reopen |
-| No `platform` entry in Claude Desktop | Quit it (Cmd+Q) *before* editing the config file, then check the file still has `mcpServers.platform` |
+| No `corecenas` entry in Claude Desktop | Quit it (Cmd+Q) *before* editing the config file, then check the file still has `mcpServers.corecenas` |
+| The login page asks for a password instead of sending you to your company | The email's domain doesn't match any company in `directory.json`. Use one of the demo emails, or add the company |
 | Only read tools show up | The app didn't ask for `platform:write`. Revoke its consent (**Users** → user → **Consents**), delete `~/.mcp-auth` for Claude Desktop, and reconnect. The consent screen should list both *Read* and *Change contact-center platform data* |
+| `429` from the gateway while testing | You hit a rate limit, e.g. 10 client registrations per minute per IP. Wait a minute |
 | Keycloak admin console spins forever | Run `make bootstrap` (it points the admin login at port 8081) |
-| Anything else | Logs: `~/Library/Logs/Claude/mcp-server-platform.log` (Claude Desktop), `make logs`, `docker compose logs keycloak`. Audit: `make audit` |
+| Anything else | Logs: `~/Library/Logs/Claude/mcp-server-corecenas.log` (Claude Desktop), `make logs`, `docker compose logs keycloak`. Audit: `make audit` |
 
 ---
 
 ## Lab simplifications
 
 - **One zone** (`eu1`). Tenant 2001 is in zone `eu2` and is refused with a pointer to `mcpeu2`.
-- **Mocks:** Entra ID is a second Keycloak realm; portal-api and rest-api are small mock services
-  with the real auth middleware but fake data.
+- **Mocks:** each company's SSO is a Keycloak realm; portal-api and rest-api are small mock
+  services with the real auth middleware but fake data.
 - **Gateway on etcd:** a Git-managed setup would usually run APISIX in standalone YAML mode.
   The lab uses etcd so the APISIX dashboard can show the config, but `apisix/apisix.yaml`
   is still the source of truth.
@@ -934,6 +1434,9 @@ lower `accessTokenLifespan` in `bootstrap/bootstrap.mjs`. The trade-off is more 
 - **Audience binding** uses Keycloak's audience-mapper workaround, not RFC 8707 Resource
   Indicators. The mappers sit on `platform:read` / `platform:write`, because a client that
   registers with an explicit scope list (Claude, ChatGPT) gets only those scopes.
+- **Company claim** comes from a user attribute set by each company's broker, because
+  Keycloak's built-in organization mapper only emits its claim when the client asks for the
+  `organization` scope, which MCP clients don't.
 - **Registration is DCR only**; the newer CIMD method is off until tested with the real clients.
 - **Internal token claims** come from one scope per tenant and per role. That's fine for a
   handful of tenants; at real scale use parameterized scopes or a custom mapper.

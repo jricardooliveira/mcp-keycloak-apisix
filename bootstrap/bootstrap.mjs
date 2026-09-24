@@ -1,7 +1,9 @@
-// Configures Keycloak (realm "corp-entra" = mock Entra ID, realm "platform" = the
-// Platform authorization server) and syncs the assignment store with
-// directory.json. Idempotent: every step creates what is missing and updates
-// what exists. Runs on `make up`, `make bootstrap` and whenever PUBLIC_URL changes.
+// Configures Keycloak and syncs the assignment store with directory.json:
+// - realm "platform": the authorization server the AI clients talk to
+// - one mock SSO realm per company (CoreCenas staff, MasIkea, VodaFundas),
+//   brokered by "platform" and picked by the user's email domain
+// Idempotent: every step creates what is missing and updates what exists.
+// Runs on `make up`, `make bootstrap` and whenever PUBLIC_URL changes.
 import { readFile } from "node:fs/promises";
 import pg from "pg";
 
@@ -10,12 +12,17 @@ const KC = required("KEYCLOAK_INTERNAL_URL");
 const MCP_URL = `${PUBLIC_URL}/mcp`;
 const DEMO_PASSWORD = required("DEMO_PASSWORD");
 
-// Tenants, staff (mock Entra users), their assignments and the hosts that
-// self-registered MCP clients may use all come from directory.json, so the
-// usual changes are an edit there plus `make bootstrap`.
+// Companies (and their SSO), tenants, people and their assignments, and the
+// hosts that self-registered MCP clients may use all come from directory.json,
+// so the usual changes are an edit there plus `make bootstrap`.
 const directory = JSON.parse(await readFile(process.env.DIRECTORY_FILE ?? "/config/directory.json", "utf8"));
+const COMPANIES = new Map(directory.companies.map((c) => [c.alias, c]));
 const TENANTS = directory.tenants.map((t) => t.tenant_id);
-const STAFF = directory.staff.map((s) => ({ email: `${s.username}@example.com`, groups: [], assignments: [], ...s }));
+const PEOPLE = directory.people.map((p) => {
+  const company = COMPANIES.get(p.company);
+  if (!company) throw new Error(`${p.username}: unknown company "${p.company}"`);
+  return { email: `${p.username}@${company.domain}`, groups: [], assignments: [], ...p, companyRef: company };
+});
 const TRUSTED_HOSTS = directory.dcrTrustedHosts;
 const ROLES = ["viewer", "support_operator", "supervisor", "admin"];
 
@@ -144,58 +151,57 @@ const hardcodedClaim = (name, claim, value, type) => ({
   },
 });
 
-// --- corp-entra: stand-in for the company's Entra ID ---------------------------
+// --- Mock company SSOs ---------------------------------------------------------
+// One realm per company plays that company's own identity provider (Entra ID,
+// Okta, ...). It holds the company's users and passwords; "platform" never does.
 
-async function configureEntra() {
-  await ensureRealm("corp-entra", {
-    displayName: "Corporate Entra ID (mock)",
-    loginWithEmailAllowed: true,
-    registrationAllowed: false,
-  });
+async function configureCompanySso(company) {
+  const realm = company.sso.realm;
+  await ensureRealm(realm, { displayName: company.sso.displayName, loginWithEmailAllowed: true, registrationAllowed: false });
 
-  const client = await ensureClient("corp-entra", {
+  const client = await ensureClient(realm, {
     clientId: "platform-keycloak-broker",
     name: "Platform authorization server (Keycloak broker)",
     protocol: "openid-connect",
     publicClient: false,
     clientAuthenticatorType: "client-secret",
-    secret: required("ENTRA_BROKER_SECRET"),
+    secret: required("SSO_BROKER_SECRET"),
     standardFlowEnabled: true,
     directAccessGrantsEnabled: false,
-    redirectUris: [`${PUBLIC_URL}/realms/platform/broker/entra/endpoint`],
+    redirectUris: [`${PUBLIC_URL}/realms/platform/broker/${company.alias}/endpoint`],
     webOrigins: [],
     attributes: { "pkce.code.challenge.method": "S256", "post.logout.redirect.uris": `${PUBLIC_URL}/*` },
   });
 
-  // Entra puts group membership into the id_token; do the same.
-  const mappers = await get(`/corp-entra/clients/${client.id}/protocol-mappers/models`);
+  // Corporate IdPs put group membership into the id_token; do the same.
+  const mappers = await get(`/${realm}/clients/${client.id}/protocol-mappers/models`);
   if (!mappers.find((m) => m.name === "groups")) {
-    await api("POST", `/corp-entra/clients/${client.id}/protocol-mappers/models`, {
+    await api("POST", `/${realm}/clients/${client.id}/protocol-mappers/models`, {
       name: "groups", protocol: "openid-connect", protocolMapper: "oidc-group-membership-mapper",
       config: { "claim.name": "groups", "full.path": "false", "id.token.claim": "true", "access.token.claim": "true", "userinfo.token.claim": "true" },
     });
   }
 
   const ids = {};
-  for (const s of STAFF) {
-    const user = await ensureUser("corp-entra", {
-      username: s.username, email: s.email, firstName: s.firstName, lastName: s.lastName,
-      password: s.password ?? DEMO_PASSWORD,
+  for (const person of PEOPLE.filter((p) => p.company === company.alias)) {
+    const user = await ensureUser(realm, {
+      username: person.username, email: person.email, firstName: person.firstName, lastName: person.lastName,
+      password: person.password ?? DEMO_PASSWORD,
     });
-    for (const g of s.groups) {
-      const group = await ensureGroup("corp-entra", g);
-      await api("PUT", `/corp-entra/users/${user.id}/groups/${group.id}`);
+    for (const g of person.groups) {
+      const group = await ensureGroup(realm, g);
+      await api("PUT", `/${realm}/users/${user.id}/groups/${group.id}`);
     }
-    ids[s.username] = user.id;
+    ids[person.username] = user.id;
   }
   return ids;
 }
 
 // --- platform: the Platform authorization server -----------------------------------
 
-async function configurePlatform(entraIds) {
+async function configurePlatform() {
   await ensureRealm("platform", {
-    displayName: "Contact Center Platform",
+    displayName: "CoreCenas",
     loginWithEmailAllowed: true,
     registrationAllowed: false,
     accessTokenLifespan: 600, // 10 min
@@ -236,6 +242,13 @@ async function configurePlatform(entraIds) {
       config: { "user.attribute": "email", "claim.name": "email", "jsonType.label": "String", "access.token.claim": "true", "id.token.claim": "false", "introspection.token.claim": "true" },
     },
     { name: "name", protocolMapper: "oidc-full-name-mapper", config: { "access.token.claim": "true", "id.token.claim": "false", "introspection.token.claim": "true" } },
+    // Which company the person belongs to: decides the home tenant of customer users.
+    // (A plain attribute: Keycloak's organization mapper only emits its claim when
+    // the client asks for the "organization" scope, which MCP clients don't.)
+    {
+      name: "company", protocolMapper: "oidc-usermodel-attribute-mapper",
+      config: { "user.attribute": "company", "claim.name": "company", "jsonType.label": "String", "access.token.claim": "true", "id.token.claim": "false", "introspection.token.claim": "true" },
+    },
   ];
   const consent = (text) => ({ "include.in.token.scope": "true", "display.on.consent.screen": "true", "consent.screen.text": text });
   await ensureClientScope("platform", {
@@ -302,79 +315,101 @@ async function configurePlatform(entraIds) {
   await setClientScopes("platform", mcp, "default", ["backend-audience", "basic"]);
   await setClientScopes("platform", mcp, "optional", [...TENANTS.map((t) => `tenant-${t}`), ...ROLES.map((r) => `role-${r}`)]);
 
-  // Staff log in through (mock) Entra; Keycloak brokers.
-  const idp = {
-    alias: "entra", displayName: "Corporate Entra ID", providerId: "oidc", enabled: true,
-    trustEmail: true, storeToken: false, firstBrokerLoginFlowAlias: "first broker login",
-    config: {
-      clientId: "platform-keycloak-broker", clientSecret: required("ENTRA_BROKER_SECRET"), clientAuthMethod: "client_secret_post",
-      authorizationUrl: `${PUBLIC_URL}/realms/corp-entra/protocol/openid-connect/auth`,
-      tokenUrl: `${KC}/realms/corp-entra/protocol/openid-connect/token`,
-      jwksUrl: `${KC}/realms/corp-entra/protocol/openid-connect/certs`,
-      userInfoUrl: `${KC}/realms/corp-entra/protocol/openid-connect/userinfo`,
-      issuer: `${PUBLIC_URL}/realms/corp-entra`,
-      useJwksUrl: "true", validateSignature: "true", pkceEnabled: "true", pkceMethod: "S256",
-      defaultScope: "openid email profile", syncMode: "FORCE",
-    },
-  };
-  const { status } = await api("GET", "/platform/identity-provider/instances/entra", undefined, { allow: [404] });
-  if (status === 404) await api("POST", "/platform/identity-provider/instances", idp);
-  else await api("PUT", "/platform/identity-provider/instances/entra", idp);
-
-  const idpMappers = await get("/platform/identity-provider/instances/entra/mappers");
-  if (!idpMappers.find((m) => m.name === "principal_type")) {
-    await api("POST", "/platform/identity-provider/instances/entra/mappers", {
-      name: "principal_type", identityProviderAlias: "entra", identityProviderMapper: "hardcoded-attribute-idp-mapper",
-      config: { syncMode: "INHERIT", attribute: "principal_type", "attribute.value": "staff" },
-    });
-  }
-
-  // Skip the login form and go straight to Entra, as staff would.
+  // Identity-first login: the user types an email, the Organization step
+  // matches its domain and sends them to that company's SSO. So no default
+  // provider on the redirector (earlier versions sent everyone to one IdP).
   const executions = await get("/platform/authentication/flows/browser/executions");
   const redirector = executions.find((e) => e.providerId === "identity-provider-redirector");
-  if (redirector && !redirector.authenticationConfig) {
-    await api("POST", `/platform/authentication/executions/${redirector.id}/config`, {
-      alias: "entra-default", config: { defaultProvider: "entra" },
-    });
+  if (redirector?.authenticationConfig) {
+    await api("DELETE", `/platform/authentication/config/${redirector.authenticationConfig}`, undefined, { allow: [404] });
   }
 
-  // Staff users exist up front, already linked to their Entra identity, so the
-  // assignment store can be keyed on the Platform subject from day one.
+  // Per company: a brokered identity provider, an Organization that owns the
+  // email domain, and the people, pre-linked to their SSO identity so the
+  // assignment store can be keyed on the platform subject from day one.
   const subjects = {};
-  for (const s of STAFF) {
-    const user = await ensureUser("platform", {
-      username: s.username, email: s.email, firstName: s.firstName, lastName: s.lastName,
-      attributes: { principal_type: ["staff"] },
-    });
-    const links = await get(`/platform/users/${user.id}/federated-identity`);
-    if (!links.find((l) => l.identityProvider === "entra")) {
-      await api("POST", `/platform/users/${user.id}/federated-identity/entra`, {
-        identityProvider: "entra", userId: entraIds[s.username], userName: s.username,
-      });
-    }
-    subjects[s.username] = user.id;
-  }
+  for (const company of COMPANIES.values()) {
+    const ssoIds = await configureCompanySso(company);
+    await ensureCompanyIdp(company);
+    const org = await ensureOrganization(company);
 
-  // One Organization per tenant later; Example Corp staff are their own org now.
-  const orgs = await get("/platform/organizations?search=Example%20Corp&exact=true");
-  let org = orgs.find((o) => o.alias === "example-corp");
-  if (!org) {
-    await api("POST", "/platform/organizations", {
-      name: "Example Corp", alias: "example-corp", enabled: true,
-      domains: [{ name: "example.com", verified: true }],
-    });
-    org = (await get("/platform/organizations?search=Example%20Corp&exact=true")).find((o) => o.alias === "example-corp");
-  }
-  const orgIdps = await get(`/platform/organizations/${org.id}/identity-providers`);
-  if (!orgIdps.find((i) => i.alias === "entra")) {
-    await api("POST", `/platform/organizations/${org.id}/identity-providers`, "entra");
-  }
-  for (const id of Object.values(subjects)) {
-    await api("POST", `/platform/organizations/${org.id}/members`, id, { allow: [409] });
+    for (const person of PEOPLE.filter((p) => p.company === company.alias)) {
+      const user = await ensureUser("platform", {
+        username: person.username, email: person.email, firstName: person.firstName, lastName: person.lastName,
+        attributes: { principal_type: [company.principal_type], company: [company.alias] },
+      });
+      const links = await get(`/platform/users/${user.id}/federated-identity`);
+      if (!links.find((l) => l.identityProvider === company.alias)) {
+        await api("POST", `/platform/users/${user.id}/federated-identity/${company.alias}`, {
+          identityProvider: company.alias, userId: ssoIds[person.username], userName: person.username,
+        });
+      }
+      await api("POST", `/platform/organizations/${org.id}/members`, user.id, { allow: [409] });
+      subjects[person.username] = user.id;
+    }
   }
 
   await configureRegistrationPolicies();
   return subjects;
+}
+
+async function ensureCompanyIdp(company) {
+  const realm = company.sso.realm;
+  const path = `/platform/identity-provider/instances/${company.alias}`;
+  const { status, data: existing } = await api("GET", path, undefined, { allow: [404] });
+  const idp = {
+    alias: company.alias, displayName: company.sso.displayName.replace(/ \(mock\)$/, ""), providerId: "oidc", enabled: true,
+    trustEmail: true, storeToken: false, firstBrokerLoginFlowAlias: "first broker login",
+    config: {
+      clientId: "platform-keycloak-broker", clientSecret: required("SSO_BROKER_SECRET"), clientAuthMethod: "client_secret_post",
+      authorizationUrl: `${PUBLIC_URL}/realms/${realm}/protocol/openid-connect/auth`,
+      tokenUrl: `${KC}/realms/${realm}/protocol/openid-connect/token`,
+      jwksUrl: `${KC}/realms/${realm}/protocol/openid-connect/certs`,
+      userInfoUrl: `${KC}/realms/${realm}/protocol/openid-connect/userinfo`,
+      issuer: `${PUBLIC_URL}/realms/${realm}`,
+      useJwksUrl: "true", validateSignature: "true", pkceEnabled: "true", pkceMethod: "S256",
+      defaultScope: "openid email profile", syncMode: "FORCE", loginHint: "true",
+    },
+  };
+  if (status === 404) await api("POST", "/platform/identity-provider/instances", idp);
+  // Merge, so the Organization link (organizationId, kc.org.*) survives re-runs.
+  else await api("PUT", path, { ...existing, ...idp, config: { ...existing.config, ...idp.config } });
+
+  // Anyone who signs in through this SSO gets the company's principal type and alias.
+  const mappers = await get(`${path}/mappers`);
+  for (const [attribute, value] of [["principal_type", company.principal_type], ["company", company.alias]]) {
+    const mapper = {
+      name: attribute, identityProviderAlias: company.alias, identityProviderMapper: "hardcoded-attribute-idp-mapper",
+      config: { syncMode: "FORCE", attribute, "attribute.value": value },
+    };
+    const current = mappers.find((m) => m.name === attribute);
+    if (!current) await api("POST", `${path}/mappers`, mapper);
+    else await api("PUT", `${path}/mappers/${current.id}`, { ...current, ...mapper });
+  }
+}
+
+async function ensureOrganization(company) {
+  const find = async () => (await get(`/platform/organizations?search=${encodeURIComponent(company.name)}&exact=true`)).find((o) => o.alias === company.alias);
+  let org = await find();
+  const rep = { name: company.name, alias: company.alias, enabled: true, domains: [{ name: company.domain, verified: true }] };
+  if (!org) {
+    await api("POST", "/platform/organizations", rep);
+    org = await find();
+  } else {
+    await api("PUT", `/platform/organizations/${org.id}`, { ...org, ...rep });
+  }
+  const linked = await get(`/platform/organizations/${org.id}/identity-providers`);
+  if (!linked.find((i) => i.alias === company.alias)) {
+    await api("POST", `/platform/organizations/${org.id}/identity-providers`, company.alias);
+  }
+  // Route users whose email matches the company's domain straight to its SSO.
+  const path = `/platform/identity-provider/instances/${company.alias}`;
+  const idp = await get(path);
+  await api("PUT", path, {
+    ...idp,
+    config: { ...idp.config, "kc.org.domain": company.domain, "kc.org.broker.redirect.mode.email-matches": "true" },
+  });
+  return org;
 }
 
 // Anonymous DCR, restricted by policy (rate-limited at APISIX too).
@@ -415,17 +450,17 @@ async function syncDirectory(subjects) {
     await db.query("BEGIN");
     for (const t of directory.tenants) {
       await db.query(
-        `INSERT INTO tenants(tenant_id, name, zone) VALUES ($1, $2, $3)
-         ON CONFLICT (tenant_id) DO UPDATE SET name = EXCLUDED.name, zone = EXCLUDED.zone`,
-        [t.tenant_id, t.name, t.zone],
+        `INSERT INTO tenants(tenant_id, name, zone, company) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (tenant_id) DO UPDATE SET name = EXCLUDED.name, zone = EXCLUDED.zone, company = EXCLUDED.company`,
+        [t.tenant_id, t.name, t.zone, t.company ?? null],
       );
     }
-    for (const s of STAFF) {
+    for (const s of PEOPLE) {
       const subject = subjects[s.username];
       await db.query(
-        `INSERT INTO principals(subject, username, email, principal_type) VALUES ($1, $2, $3, 'staff')
-         ON CONFLICT (subject) DO UPDATE SET username = EXCLUDED.username, email = EXCLUDED.email`,
-        [subject, s.username, s.email],
+        `INSERT INTO principals(subject, username, email, principal_type) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (subject) DO UPDATE SET username = EXCLUDED.username, email = EXCLUDED.email, principal_type = EXCLUDED.principal_type`,
+        [subject, s.username, s.email, s.companyRef.principal_type],
       );
       for (const a of s.assignments) {
         await db.query(
@@ -465,7 +500,6 @@ async function configureMaster() {
 
 await login();
 await configureMaster();
-const entraIds = await configureEntra();
-const subjects = await configurePlatform(entraIds);
+const subjects = await configurePlatform();
 await syncDirectory(subjects);
 console.log(JSON.stringify({ ok: true, issuer: `${PUBLIC_URL}/realms/platform`, mcp: MCP_URL, subjects }));

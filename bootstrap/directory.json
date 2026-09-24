@@ -1,26 +1,53 @@
 {
-  "tenants": [
-    { "tenant_id": 1001, "name": "Acme Retail", "zone": "eu1" },
-    { "tenant_id": 1002, "name": "Globex Telecom", "zone": "eu1" },
-    { "tenant_id": 2001, "name": "Initech Bank", "zone": "eu2" }
-  ],
-  "staff": [
+  "companies": [
     {
-      "username": "alice", "firstName": "Alice", "lastName": "Almeida", "groups": ["customer-success"],
+      "alias": "corecenas", "name": "CoreCenas", "domain": "corecenas.example", "principal_type": "staff",
+      "sso": { "realm": "corecenas-entra", "displayName": "CoreCenas Entra ID (mock)" }
+    },
+    {
+      "alias": "masikea", "name": "MasIkea", "domain": "masikea.example", "principal_type": "customer_user",
+      "sso": { "realm": "masikea-entra", "displayName": "MasIkea Entra ID (mock)" }
+    },
+    {
+      "alias": "vodafundas", "name": "VodaFundas", "domain": "vodafundas.example", "principal_type": "customer_user",
+      "sso": { "realm": "vodafundas-okta", "displayName": "VodaFundas Okta (mock)" }
+    }
+  ],
+  "tenants": [
+    { "tenant_id": 1001, "name": "MasIkea", "zone": "eu1", "company": "masikea" },
+    { "tenant_id": 1002, "name": "VodaFundas", "zone": "eu1", "company": "vodafundas" },
+    { "tenant_id": 2001, "name": "Initech Bank", "zone": "eu2", "company": null }
+  ],
+  "people": [
+    {
+      "username": "alice", "company": "corecenas", "firstName": "Alice", "lastName": "Almeida",
       "assignments": [
-        { "tenant_id": 1001, "role": "supervisor", "expires_at": "2026-12-31", "reason": "Campaign work for Acme" },
-        { "tenant_id": 1002, "role": "support_operator", "expires_at": null, "reason": "Segment work for Globex" },
-        { "tenant_id": 2001, "role": "supervisor", "expires_at": null, "reason": "Tenant in zone eu2 (rejected by the eu1 MCP server)" }
+        { "tenant_id": 1001, "role": "supervisor", "expires_at": "2026-12-31", "reason": "Campaign work for MasIkea" },
+        { "tenant_id": 1002, "role": "support_operator", "expires_at": null, "reason": "Segment work for VodaFundas" },
+        { "tenant_id": 2001, "role": "supervisor", "expires_at": null, "reason": "Tenant in zone eu2 (refused by the eu1 MCP server)" }
       ]
     },
     {
-      "username": "bob", "firstName": "Bob", "lastName": "Barros", "groups": ["customer-success"],
+      "username": "bob", "company": "corecenas", "firstName": "Bob", "lastName": "Barros",
       "assignments": [
         { "tenant_id": 1001, "role": "viewer", "expires_at": null, "reason": "Read-only onboarding" },
         { "tenant_id": 1002, "role": "support_operator", "expires_at": "2026-01-01", "reason": "Expired assignment" }
       ]
     },
-    { "username": "carol", "firstName": "Carol", "lastName": "Costa", "groups": ["engineering"], "assignments": [] }
+    { "username": "carol", "company": "corecenas", "firstName": "Carol", "lastName": "Costa", "assignments": [] },
+    {
+      "username": "marta", "company": "masikea", "firstName": "Marta", "lastName": "Moura",
+      "assignments": [
+        { "tenant_id": 1001, "role": "supervisor", "expires_at": null, "reason": "MasIkea contact-center lead" }
+      ]
+    },
+    {
+      "username": "vasco", "company": "vodafundas", "firstName": "Vasco", "lastName": "Vieira",
+      "assignments": [
+        { "tenant_id": 1002, "role": "support_operator", "expires_at": null, "reason": "VodaFundas support team" },
+        { "tenant_id": 1001, "role": "viewer", "expires_at": null, "reason": "Mistake on purpose: another company's tenant (refused by the home-tenant check)" }
+      ]
+    }
   ],
   "dcrTrustedHosts": [
     "localhost", "127.0.0.1",

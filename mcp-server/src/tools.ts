@@ -53,7 +53,7 @@ export const TOOLS: ToolDef[] = [
     run: async (ctx) => {
       const assignments = await listAssignments(ctx.principal.subject);
       return {
-        you: { subject: ctx.principal.subject, email: ctx.principal.email, name: ctx.principal.name, principal_type: ctx.principal.principalType, client: ctx.principal.clientId },
+        you: { subject: ctx.principal.subject, email: ctx.principal.email, name: ctx.principal.name, principal_type: ctx.principal.principalType, company: ctx.principal.company, client: ctx.principal.clientId },
         scopes: [...ctx.principal.scopes].filter((s) => s.startsWith("platform:")),
         mcp_server: { name: config.serverName, zone: config.zone },
         assignments: assignments.map((a) => ({

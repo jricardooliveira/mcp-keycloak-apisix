@@ -10,6 +10,8 @@ export interface Principal {
   email?: string;
   name?: string;
   scopes: Set<string>;
+  /** The person's company (alias), from the `company` claim. Decides a customer user's home tenant. */
+  company?: string;
   /** The client's access token. Only ever used as subject_token for token exchange, never forwarded. */
   accessToken: string;
 }
@@ -39,6 +41,7 @@ export async function verifyAccessToken(token: string): Promise<Principal> {
       email: payload.email as string | undefined,
       name: payload.name as string | undefined,
       scopes: new Set(String(payload.scope ?? "").split(" ").filter(Boolean)),
+      company: payload.company as string | undefined,
       accessToken: token,
     };
   } catch (e) {

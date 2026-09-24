@@ -32,7 +32,7 @@ paths:
                 type: object
                 properties:
                   tenant_id: { type: integer, example: 1001 }
-                  name: { type: string, example: Acme Retail }
+                  name: { type: string, example: MasIkea }
                   timezone: { type: string, example: Europe/Lisbon }
                   languages: { type: array, items: { type: string }, example: [pt, en] }
                   settings: { $ref: "#/components/schemas/Settings" }
@@ -170,4 +170,4 @@ components:
       type: object
       properties:
         callback_window_hours: { type: integer, example: 24 }
-        sms_sender_id: { type: string, example: ACME }
+        sms_sender_id: { type: string, example: MASIKEA }

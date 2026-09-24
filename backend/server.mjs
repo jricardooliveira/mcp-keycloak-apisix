@@ -33,7 +33,7 @@ app.use(async (req, res, next) => {
 // --- fake per-tenant data ----------------------------------------------------
 const data = {
   1001: {
-    name: "Acme Retail", timezone: "Europe/Lisbon", languages: ["pt", "en"],
+    name: "MasIkea", timezone: "Europe/Lisbon", languages: ["pt", "en"],
     skills: [
       { id: 11, name: "Sales PT", channel: "voice", agents: 14, queue: 3 },
       { id: 12, name: "Support EN", channel: "chat", agents: 9, queue: 7 },
@@ -52,17 +52,17 @@ const data = {
       { id: "c-3", name: "Ana Rodrigues", email: "ana.rodrigues@example.com", phone: "+351910000003", segment: "seg-vip", lifetime_value: 9100 },
     ],
     leads: [{ id: "l-900", name: "Rui Costa", phone: "+351910000009", source: "web-form", status: "new" }],
-    settings: { callback_window_hours: 24, sms_sender_id: "ACME" },
+    settings: { callback_window_hours: 24, sms_sender_id: "MASIKEA" },
     blacklist: [],
   },
   1002: {
-    name: "Globex Telecom", timezone: "Europe/Madrid", languages: ["es", "en"],
+    name: "VodaFundas", timezone: "Europe/Madrid", languages: ["es", "en"],
     skills: [{ id: 21, name: "Retention ES", channel: "voice", agents: 30, queue: 12 }],
     campaigns: [{ id: 601, name: "5G upgrade", status: "draft", type: "outbound-voice", contacts: 50000, reached: 0, converted: 0 }],
     segments: [{ id: "seg-prepaid", name: "Prepaid users", rule: "plan = 'prepaid'", size: 21000 }],
     customers: [{ id: "c-10", name: "Lucía García", email: "lucia.garcia@example.com", phone: "+34600000010", segment: "seg-prepaid", lifetime_value: 540 }],
     leads: [],
-    settings: { callback_window_hours: 48, sms_sender_id: "GLOBEX" },
+    settings: { callback_window_hours: 48, sms_sender_id: "VODAFUNDAS" },
     blacklist: [],
   },
   2001: {

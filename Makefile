@@ -18,11 +18,13 @@ reset: ## Stop and delete all data
 	docker compose --profile tunnel down -v
 
 test: ## End-to-end: DCR, PKCE login via mock Entra, consent, MCP calls
-	node tests/e2e.mjs alice
-	node tests/e2e.mjs bob
+	node tests/e2e.mjs alice@corecenas.example
+	node tests/e2e.mjs bob@corecenas.example
+	node tests/e2e.mjs marta@masikea.example
+	node tests/e2e.mjs vasco@vodafundas.example
 
 test-readonly: ## Same with a platform:read-only token (403 step-up)
-	E2E_SCOPE=platform:read node tests/e2e.mjs alice
+	E2E_SCOPE=platform:read node tests/e2e.mjs alice@corecenas.example
 
 tunnel: ## Public HTTPS URL for claude.ai / ChatGPT
 	./scripts/tunnel.sh
@@ -48,5 +50,5 @@ assignments: ## Who may work in which tenant
 	docker compose exec -T postgres psql -U platform -d platform -c "SELECT p.username, a.tenant_id, t.name tenant, t.zone, a.role, a.expires_at, a.reason FROM assignments a JOIN principals p USING (subject) JOIN tenants t USING (tenant_id) ORDER BY 1, 2;"
 
 claude: ## Add this MCP server to Claude Code
-	claude mcp add --transport http platform "$$(grep ^PUBLIC_URL .env | cut -d= -f2)/mcp"
-	@echo "Then run /mcp in Claude Code and choose platform > Authenticate."
+	claude mcp add --transport http corecenas "$$(grep ^PUBLIC_URL .env | cut -d= -f2)/mcp"
+	@echo "Then run /mcp in Claude Code and choose corecenas > Authenticate."

@@ -30,7 +30,7 @@ plugin_configs:
       request-id: { header_name: X-Request-Id, include_in_response: true }
       proxy-rewrite:
         headers:
-          remove: [X-Tenant-ID, X-Tenant-Id, X-User, X-User-Id, X-Userinfo, X-Access-Token, X-ID-Token, X-Forwarded-User, X-Remote-User, X-Auth-Request-User]
+          remove: [X-Tenant-ID, X-Company, X-User, X-User-Id, X-Userinfo, X-Access-Token, X-ID-Token, X-Forwarded-User, X-Remote-User, X-Auth-Request-User]
       prometheus: {}
 
 routes:
@@ -150,12 +150,14 @@ routes:
       limit-count: { count: 120, time_window: 60, key_type: var, key: remote_addr, rejected_code: 429, policy: redis, redis_host: redis, redis_port: 6379 }
       client-control: { max_body_size: 65536 }
 
-  # Login pages, consent, brokering to (mock) Entra, static resources. The
-  # master realm and the admin console are never exposed.
+  # Login pages, consent, brokering to the company SSOs, static resources.
+  # The master realm and the admin console are never exposed.
   - id: as-login
     name: "Login, consent, broker"
-    desc: "Keycloak login and consent pages for realms platform and corp-entra (mock Entra); master realm and admin console never exposed"
-    uris: [/realms/platform/*, /realms/corp-entra/*, /resources/*]
+    desc: "Keycloak login and consent pages: realm platform and every company SSO realm. The master realm and admin console are never exposed"
+    uris: [/realms/*, /resources/*]
+    # Every realm except master: adding a company SSO realm needs no gateway change.
+    vars: [["uri", "!", "~~", "^/realms/master(/|$)"]]
     upstream_id: keycloak
     plugin_config_id: edge
     plugins:
