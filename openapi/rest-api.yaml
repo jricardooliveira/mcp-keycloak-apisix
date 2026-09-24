@@ -1,0 +1,236 @@
+openapi: 3.1.0
+info:
+  title: Mock rest-api REST /1.0/
+  version: 0.1.0
+  description: |
+    Mock of the contact-center platform rest-api REST API (`backend/server.mjs`, `SERVICE=rest-api`),
+    limited to the operations the MCP tools use. Paths mirror the real `/1.0/` routes.
+
+    **Not reachable from outside the docker network.** Only the MCP server calls it,
+    with an internal JWT that Keycloak mints by token exchange (RFC 8693). The tenant
+    comes from the token's `tenant_id` claim, never from the URL or a header.
+servers:
+  - url: http://rest-api:4000/1.0
+    description: internal docker network only
+security:
+  - internalJwt: []
+tags:
+  - { name: skills, description: "Contact-center skills (queues)" }
+  - { name: segments }
+  - { name: customers, description: "Personal data (MCP tier T1)" }
+  - { name: leads }
+  - { name: outbound, description: "Blacklist and SMS (MCP tier T3)" }
+paths:
+  /skill:
+    get:
+      tags: [skills]
+      summary: List skills
+      description: "MCP tool: list_skills (T0)"
+      responses:
+        "200": { description: Skills, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Skill" } } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /skill/{id}/schedule:
+    get:
+      tags: [skills]
+      summary: Weekly opening schedule of one skill
+      description: "MCP tool: get_skill_schedule (T0)"
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer }, example: 11 }]
+      responses:
+        "200":
+          description: Schedule
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  skill: { type: integer }
+                  timezone: { type: string, example: Europe/Lisbon }
+                  week: { type: object, additionalProperties: { type: string }, example: { mon_fri: "08:00-20:00", sat: "09:00-13:00", sun: closed } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /segment:
+    get:
+      tags: [segments]
+      summary: List segments
+      description: "MCP tool: list_segments (T0)"
+      responses:
+        "200": { description: Segments, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Segment" } } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [segments]
+      summary: Create a segment, or update it when id exists
+      description: "MCP tool: upsert_segment (T2, plan then execute)"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, rule]
+              properties:
+                id: { type: string, description: Existing segment id to update, example: seg-vip }
+                name: { type: string, example: High spenders }
+                rule: { type: string, example: lifetime_value > 8000 }
+      responses:
+        "200": { description: Updated, content: { application/json: { schema: { $ref: "#/components/schemas/Segment" } } } }
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/Segment" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /customers:
+    get:
+      tags: [customers]
+      summary: Search customers by name, email or phone
+      description: "MCP tool: search_customers (T1, needs a purpose)"
+      parameters:
+        - { name: q, in: query, schema: { type: string }, example: maria }
+        - { name: limit, in: query, schema: { type: integer, default: 20, maximum: 50 } }
+      responses:
+        "200": { description: Matching customers, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Customer" } } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /customers/{id}:
+    get:
+      tags: [customers]
+      summary: Get one customer profile
+      description: "MCP tool: get_customer_profile (T1)"
+      parameters: [{ name: id, in: path, required: true, schema: { type: string }, example: c-1 }]
+      responses:
+        "200": { description: Customer, content: { application/json: { schema: { $ref: "#/components/schemas/Customer" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /leads/{id}:
+    get:
+      tags: [leads]
+      summary: Get one lead
+      description: "MCP tool: get_lead (T1)"
+      parameters: [{ name: id, in: path, required: true, schema: { type: string }, example: l-900 }]
+      responses:
+        "200": { description: Lead, content: { application/json: { schema: { $ref: "#/components/schemas/Lead" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /form2lead:
+    post:
+      tags: [leads]
+      summary: Create a lead
+      description: "MCP tool: create_lead (T2, plan then execute)"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, phone]
+              properties:
+                name: { type: string, example: Rui Almeida }
+                phone: { type: string, example: "+351910000077" }
+                email: { type: string, format: email }
+                notes: { type: string, maxLength: 500 }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/Lead" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /blacklists:
+    post:
+      tags: [outbound]
+      summary: Add a phone number to the do-not-contact list
+      description: "MCP tool: add_to_blacklist (T3, plan then explicit confirmation)"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, reason]
+              properties:
+                phone: { type: string, example: "+351910000002" }
+                reason: { type: string, example: Customer asked not to be contacted }
+      responses:
+        "201": { description: Blacklisted, content: { application/json: { schema: { type: object, properties: { blacklisted: { type: string } } } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /sms/send:
+    post:
+      tags: [outbound]
+      summary: Send one SMS from the tenant's sender id
+      description: "MCP tool: send_sms (T3, plan with cost estimate then explicit confirmation)"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to, text]
+              properties:
+                to: { type: string, example: "+351910000002" }
+                text: { type: string, maxLength: 640, example: Your order has shipped. }
+      responses:
+        "202":
+          description: Queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message_id: { type: string, example: sms-1001 }
+                  to: { type: string }
+                  sender: { type: string, example: ACME }
+                  status: { type: string, enum: [queued] }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { description: Recipient is blacklisted, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+components:
+  securitySchemes:
+    internalJwt:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Internal token from Keycloak standard token exchange, signed with the `platform`
+        realm keys and valid 5 minutes. Required claims:
+
+        - `iss` = `${PUBLIC_URL}/realms/platform`
+        - `aud` = `platform-backend`
+        - `tenant_id` (integer): the one tenant this request may touch
+        - `role`: the person's role in that tenant
+        - `act.sub` = `platform-mcp-server`: the MCP server acted for the person
+        - `sub`: the person
+  responses:
+    Unauthorized:
+      description: Missing, invalid or unpinned internal token
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" }, example: { error: "invalid internal token: token not pinned to a tenant" } } }
+    NotFound:
+      description: Not found in this tenant
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+  schemas:
+    Error:
+      type: object
+      properties: { error: { type: string } }
+    Skill:
+      type: object
+      properties:
+        id: { type: integer, example: 11 }
+        name: { type: string, example: Sales PT }
+        channel: { type: string, enum: [voice, chat] }
+        agents: { type: integer, example: 14 }
+        queue: { type: integer, example: 3 }
+    Segment:
+      type: object
+      properties:
+        id: { type: string, example: seg-vip }
+        name: { type: string, example: VIP customers }
+        rule: { type: string, example: lifetime_value > 5000 }
+        size: { type: integer, example: 820 }
+    Customer:
+      type: object
+      properties:
+        id: { type: string, example: c-1 }
+        name: { type: string, example: Maria Santos }
+        email: { type: string, example: maria.santos@example.com }
+        phone: { type: string, example: "+351910000001" }
+        segment: { type: string, example: seg-vip }
+        lifetime_value: { type: number, example: 7200 }
+    Lead:
+      type: object
+      properties:
+        id: { type: string, example: l-900 }
+        name: { type: string, example: Rui Costa }
+        phone: { type: string }
+        email: { type: string }
+        notes: { type: string }
+        source: { type: string, example: web-form }
+        status: { type: string, example: new }

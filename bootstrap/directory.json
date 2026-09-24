@@ -1,0 +1,31 @@
+{
+  "tenants": [
+    { "tenant_id": 1001, "name": "Acme Retail", "zone": "eu1" },
+    { "tenant_id": 1002, "name": "Globex Telecom", "zone": "eu1" },
+    { "tenant_id": 2001, "name": "Initech Bank", "zone": "eu2" }
+  ],
+  "staff": [
+    {
+      "username": "alice", "firstName": "Alice", "lastName": "Almeida", "groups": ["customer-success"],
+      "assignments": [
+        { "tenant_id": 1001, "role": "supervisor", "expires_at": "2026-12-31", "reason": "Campaign work for Acme" },
+        { "tenant_id": 1002, "role": "support_operator", "expires_at": null, "reason": "Segment work for Globex" },
+        { "tenant_id": 2001, "role": "supervisor", "expires_at": null, "reason": "Tenant in zone eu2 (rejected by the eu1 MCP server)" }
+      ]
+    },
+    {
+      "username": "bob", "firstName": "Bob", "lastName": "Barros", "groups": ["customer-success"],
+      "assignments": [
+        { "tenant_id": 1001, "role": "viewer", "expires_at": null, "reason": "Read-only onboarding" },
+        { "tenant_id": 1002, "role": "support_operator", "expires_at": "2026-01-01", "reason": "Expired assignment" }
+      ]
+    },
+    { "username": "carol", "firstName": "Carol", "lastName": "Costa", "groups": ["engineering"], "assignments": [] }
+  ],
+  "dcrTrustedHosts": [
+    "localhost", "127.0.0.1",
+    "claude.ai", "claude.com", "anthropic.com",
+    "chatgpt.com", "openai.com", "platform.openai.com",
+    "github.com"
+  ]
+}

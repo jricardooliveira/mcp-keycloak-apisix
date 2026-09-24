@@ -1,0 +1,173 @@
+openapi: 3.1.0
+info:
+  title: Mock portal-api
+  version: 0.1.0
+  description: |
+    Mock of the portal-api routes the MCP tools use (`backend/server.mjs`, `SERVICE=portal-api`).
+
+    **Not reachable from outside the docker network.** Only the MCP server calls it,
+    with the same Keycloak-exchanged internal JWT as rest-api. The tenant comes from the
+    token's `tenant_id` claim; portal-api's own session and CSRF auth is not involved.
+servers:
+  - url: http://portal-api:4000
+    description: internal docker network only
+security:
+  - internalJwt: []
+tags:
+  - { name: tenant, description: Tenant configuration and settings }
+  - { name: stats }
+  - { name: campaigns }
+paths:
+  /client/config:
+    get:
+      tags: [tenant]
+      summary: Tenant configuration
+      description: "MCP tool: get_my_context with tenant_id (T0)"
+      responses:
+        "200":
+          description: Config
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenant_id: { type: integer, example: 1001 }
+                  name: { type: string, example: Acme Retail }
+                  timezone: { type: string, example: Europe/Lisbon }
+                  languages: { type: array, items: { type: string }, example: [pt, en] }
+                  settings: { $ref: "#/components/schemas/Settings" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /client/settings/{key}:
+    put:
+      tags: [tenant]
+      summary: Change one existing tenant setting
+      description: "MCP tool: update_tenant_setting (T2, supervisor, plan then execute)"
+      parameters: [{ name: key, in: path, required: true, schema: { type: string, enum: [callback_window_hours, sms_sender_id] } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [value]
+              properties: { value: { oneOf: [{ type: string }, { type: number }, { type: boolean }], example: 48 } }
+      responses:
+        "200":
+          description: Changed
+          content: { application/json: { schema: { type: object, properties: { key: { type: string }, previous: {}, value: {} } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /stats/global:
+    get:
+      tags: [stats]
+      summary: Realtime agents online and contacts waiting
+      description: "MCP tool: get_realtime_stats (T0)"
+      responses:
+        "200":
+          description: Stats
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agents_online: { type: integer, example: 23 }
+                  contacts_waiting: { type: integer, example: 10 }
+                  by_skill:
+                    type: array
+                    items: { type: object, properties: { id: { type: integer }, name: { type: string }, queue: { type: integer } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /campaign:
+    get:
+      tags: [campaigns]
+      summary: List campaigns
+      description: "MCP tool: list_campaigns (T0)"
+      responses:
+        "200": { description: Campaigns, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/CampaignSummary" } } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /campaign/{id}/stats:
+    get:
+      tags: [campaigns]
+      summary: Campaign stats
+      description: "MCP tool: get_campaign_stats (T0); also read by the start_campaign plan"
+      parameters: [{ $ref: "#/components/parameters/CampaignId" }]
+      responses:
+        "200":
+          description: Stats
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: integer }
+                  contacts: { type: integer, example: 12400 }
+                  reached: { type: integer, example: 3100 }
+                  converted: { type: integer, example: 410 }
+                  conversion_rate: { type: number, example: 0.132 }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /campaign/{id}/start:
+    post:
+      tags: [campaigns]
+      summary: Start or resume a campaign
+      description: "MCP tool: start_campaign (T3, supervisor, plan with reach and cost then explicit confirmation)"
+      parameters: [{ $ref: "#/components/parameters/CampaignId" }]
+      responses:
+        "200": { $ref: "#/components/responses/StatusChange" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /campaign/{id}/pause:
+    post:
+      tags: [campaigns]
+      summary: Pause a campaign
+      description: "MCP tool: pause_campaign (T3, supervisor, plan then confirmation)"
+      parameters: [{ $ref: "#/components/parameters/CampaignId" }]
+      responses:
+        "200": { $ref: "#/components/responses/StatusChange" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+components:
+  securitySchemes:
+    internalJwt:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Internal token from Keycloak standard token exchange, valid 5 minutes, with
+        `aud=platform-backend`, `tenant_id`, `role` and `act.sub=platform-mcp-server`.
+        See the rest-api spec for the full claim list.
+  parameters:
+    CampaignId: { name: id, in: path, required: true, schema: { type: integer }, example: 501 }
+  responses:
+    Unauthorized:
+      description: Missing, invalid or unpinned internal token
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    NotFound:
+      description: Not found in this tenant
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    StatusChange:
+      description: Status changed
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              id: { type: integer }
+              previous: { $ref: "#/components/schemas/CampaignStatus" }
+              status: { $ref: "#/components/schemas/CampaignStatus" }
+  schemas:
+    Error:
+      type: object
+      properties: { error: { type: string } }
+    CampaignStatus: { type: string, enum: [draft, running, paused] }
+    CampaignSummary:
+      type: object
+      properties:
+        id: { type: integer, example: 501 }
+        name: { type: string, example: Black Friday reactivation }
+        status: { $ref: "#/components/schemas/CampaignStatus" }
+        type: { type: string, enum: [outbound-voice, sms] }
+    Settings:
+      type: object
+      properties:
+        callback_window_hours: { type: integer, example: 24 }
+        sms_sender_id: { type: string, example: ACME }

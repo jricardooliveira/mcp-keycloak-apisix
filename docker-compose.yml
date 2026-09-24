@@ -1,0 +1,186 @@
+# mcp-keycloak-apisix — an OAuth-protected, multi-tenant MCP server lab.
+name: mcp-keycloak-apisix
+# Clients (Claude, ChatGPT) only ever reach APISIX on :9080, which fronts the
+# Keycloak login paths and the MCP server. Everything else stays on the
+# internal network.
+
+x-node-env: &node-env
+  PUBLIC_URL: ${PUBLIC_URL}
+  KEYCLOAK_INTERNAL_URL: http://keycloak:8080
+  DATABASE_URL: postgres://platform:platform@postgres:5432/platform
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: platform
+      POSTGRES_PASSWORD: platform
+      POSTGRES_DB: platform
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U platform -d platform"]
+      interval: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      retries: 30
+
+  # Platform authorization server. One issuer: ${PUBLIC_URL}/realms/platform.
+  # The realm "corp-entra" stands in for the company's Entra ID tenant and is
+  # brokered by realm "platform" exactly as Entra would be.
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.7
+    command: ["start-dev"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: platform
+      KC_DB_PASSWORD: platform
+      KC_HOSTNAME: ${PUBLIC_URL}
+      KC_HOSTNAME_ADMIN: http://localhost:8081
+      # All endpoints advertise PUBLIC_URL; internal services call keycloak:8080 directly.
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "false"
+      KC_PROXY_HEADERS: xforwarded
+      KC_HTTP_ENABLED: "true"
+      KC_HEALTH_ENABLED: "true"
+    ports:
+      - "127.0.0.1:8081:8080" # admin console, local only (never via APISIX)
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q UP <&3"]
+      interval: 5s
+      retries: 60
+
+  # Configures both realms and the DCR policies, and syncs tenants, staff and
+  # assignments from bootstrap/directory.json. Idempotent: make bootstrap.
+  bootstrap:
+    build: ./bootstrap
+    environment:
+      <<: *node-env
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      MCP_TOKEN_EXCHANGE_SECRET: ${MCP_TOKEN_EXCHANGE_SECRET:-local-mcp-exchange-secret}
+      ENTRA_BROKER_SECRET: ${ENTRA_BROKER_SECRET:-local-entra-broker-secret}
+      DEMO_PASSWORD: ${DEMO_PASSWORD:-Passw0rd!}
+    volumes:
+      # folder mount: single-file bind mounts can go stale on Docker Desktop for macOS
+      - ./bootstrap:/config:ro
+    depends_on:
+      keycloak: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    restart: "no"
+
+  mcp-server:
+    build: ./mcp-server
+    environment:
+      <<: *node-env
+      MCP_ZONE: eu1
+      REDIS_URL: redis://redis:6379
+      MCP_TOKEN_EXCHANGE_CLIENT_ID: platform-mcp-server
+      MCP_TOKEN_EXCHANGE_SECRET: ${MCP_TOKEN_EXCHANGE_SECRET:-local-mcp-exchange-secret}
+      CONFIRMATION_SIGNING_KEY: ${CONFIRMATION_SIGNING_KEY:-local-confirmation-key-change-me}
+      REST_API_URL: http://rest-api:4000
+      PORTAL_API_URL: http://portal-api:4000
+    depends_on:
+      bootstrap: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+
+  # Mock portal-api and rest-api: same image, each validates the exchanged
+  # one-tenant internal JWT (the only change a real backend would need).
+  rest-api:
+    build: ./backend
+    environment:
+      <<: *node-env
+      SERVICE: rest-api
+    depends_on:
+      keycloak: { condition: service_healthy }
+
+  portal-api:
+    build: ./backend
+    environment:
+      <<: *node-env
+      SERVICE: portal-api
+    depends_on:
+      keycloak: { condition: service_healthy }
+
+  # Gateway config store, so the APISIX dashboard can browse and edit routes.
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.21
+    command:
+      - etcd
+      - --name=apisix-etcd
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd:2379
+    volumes:
+      - etcddata:/etcd-data
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 3s
+      retries: 30
+
+  apisix:
+    image: apache/apisix:latest
+    environment:
+      APISIX_ADMIN_KEY: ${APISIX_ADMIN_KEY:-local-apisix-admin-key}
+    volumes:
+      - ./apisix/config.yaml:/usr/local/apisix/conf/config.yaml:ro
+    ports:
+      - "127.0.0.1:9080:9080" # public listener (MCP + auth server)
+      - "127.0.0.1:9180:9180" # admin API + dashboard at /ui, local only
+    depends_on:
+      etcd: { condition: service_healthy }
+      keycloak: { condition: service_healthy }
+      mcp-server: { condition: service_started }
+    healthcheck:
+      # No curl in the image: raw HTTP over bash's /dev/tcp.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9180 && printf 'GET /apisix/admin/routes HTTP/1.0\\r\\nX-API-KEY: %s\\r\\n\\r\\n' \"$$APISIX_ADMIN_KEY\" >&3 && head -1 <&3 | grep -q ' 200 '"]
+      interval: 3s
+      retries: 40
+
+  # Loads apisix/apisix.yaml (the Git-managed gateway config) into etcd and
+  # removes anything not in the file. Re-run with: make gateway-sync
+  gateway-seed:
+    build: ./apisix/seed
+    environment:
+      PUBLIC_URL: ${PUBLIC_URL}
+      APISIX_ADMIN_KEY: ${APISIX_ADMIN_KEY:-local-apisix-admin-key}
+    volumes:
+      - ./apisix/apisix.yaml:/config/apisix.yaml:ro
+    depends_on:
+      apisix: { condition: service_healthy }
+    restart: "no"
+
+  # Read-only docs for the mock portal-api / rest-api APIs the MCP tools call.
+  # "Try it out" is off: the backends are internal and only accept the
+  # exchanged internal JWT, never a browser.
+  api-docs:
+    image: swaggerapi/swagger-ui:latest
+    environment:
+      URLS: '[{"url":"specs/rest-api.yaml","name":"rest-api REST /1.0/ (mock)"},{"url":"specs/portal-api.yaml","name":"portal-api (mock)"}]'
+      URLS_PRIMARY_NAME: rest-api REST /1.0/ (mock)
+      SUPPORTED_SUBMIT_METHODS: "[]"
+    volumes:
+      - ./openapi:/usr/share/nginx/html/specs:ro
+    ports:
+      - "127.0.0.1:8082:8080"
+
+  # Public HTTPS entry for claude.ai / ChatGPT (they connect from the cloud).
+  # Only started by `make tunnel`.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: ["tunnel", "--no-autoupdate", "--url", "http://apisix:9080"]
+    profiles: ["tunnel"]
+    depends_on: [apisix]
+
+volumes:
+  pgdata:
+  etcddata:

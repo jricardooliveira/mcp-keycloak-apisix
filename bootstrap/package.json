@@ -1,0 +1,6 @@
+{
+  "name": "platform-bootstrap",
+  "private": true,
+  "type": "module",
+  "dependencies": { "pg": "^8.16.0" }
+}

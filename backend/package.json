@@ -1,0 +1,6 @@
+{
+  "name": "platform-mock-backend",
+  "private": true,
+  "type": "module",
+  "dependencies": { "express": "^5.2.1", "jose": "^6.2.0" }
+}

@@ -1,0 +1,45 @@
+# APISIX in traditional mode: config lives in etcd so the built-in dashboard
+# (http://localhost:9180/ui) can browse and edit it. apisix.yaml in this folder
+# stays the source of truth: the gateway-seed job loads it into etcd on start
+# and removes anything not in the file (make gateway-sync re-runs it).
+apisix:
+  node_listen: 9080
+  enable_admin: true
+  enable_ipv6: false
+  # Keep X-Forwarded-Proto/Host from peers on the docker network (cloudflared
+  # terminates TLS in tunnel mode). The only other ingress is 127.0.0.1:9080.
+  trusted_addresses:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+
+deployment:
+  role: traditional
+  role_traditional:
+    config_provider: etcd
+  etcd:
+    host:
+      - http://etcd:2379
+    prefix: /apisix
+  admin:
+    enable_admin_ui: true
+    # Admin API + dashboard on :9180, published on 127.0.0.1 only and never
+    # routed through the public listener on :9080.
+    admin_listen:
+      ip: 0.0.0.0
+      port: 9180
+    allow_admin:
+      - 0.0.0.0/0
+    admin_key:
+      - name: admin
+        key: ${{APISIX_ADMIN_KEY}}
+        role: admin
+
+nginx_config:
+  error_log_level: warn
+
+plugin_attr:
+  prometheus:
+    export_addr:
+      ip: 0.0.0.0
+      port: 9091

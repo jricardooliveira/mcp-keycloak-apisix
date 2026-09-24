@@ -1,0 +1,6 @@
+{
+  "name": "platform-gateway-seed",
+  "private": true,
+  "type": "module",
+  "dependencies": { "yaml": "^2.8.0" }
+}

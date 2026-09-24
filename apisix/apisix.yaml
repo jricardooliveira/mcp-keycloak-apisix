@@ -1,0 +1,163 @@
+# Platform API gateway — one public entrance for the MCP server and the
+# authorization server. Source of truth for the gateway config: the
+# gateway-seed job loads this file into etcd (make gateway-sync), replacing
+# ${{PUBLIC_URL}} from the environment. Edits made in the dashboard are live
+# but are overwritten by the next sync unless copied back here.
+#
+# Every route gets the edge controls from the design: rate limits, request
+# size limits, request ids, access logs, and stripping of any identity header a
+# client tries to smuggle in. The gateway filters; it never decides what a
+# person may do, and it never turns a token into trusted headers.
+
+upstreams:
+  - id: mcp
+    name: "platform-mcp-server"
+    nodes: { "mcp-server:3000": 1 }
+    type: roundrobin
+    pass_host: pass
+    timeout: { connect: 5, send: 60, read: 300 } # long-running MCP responses
+  - id: keycloak
+    name: "keycloak"
+    nodes: { "keycloak:8080": 1 }
+    type: roundrobin
+    pass_host: pass
+    timeout: { connect: 5, send: 30, read: 30 }
+
+plugin_configs:
+  - id: edge
+    desc: "Edge controls on every route: request id, identity-header stripping, Prometheus"
+    plugins:
+      request-id: { header_name: X-Request-Id, include_in_response: true }
+      proxy-rewrite:
+        headers:
+          remove: [X-Tenant-ID, X-Tenant-Id, X-User, X-User-Id, X-Userinfo, X-Access-Token, X-ID-Token, X-Forwarded-User, X-Remote-User, X-Auth-Request-User]
+      prometheus: {}
+
+routes:
+  # --- MCP server ---------------------------------------------------------
+  # With a bearer token: validate it at the edge first (signature via JWKS,
+  # issuer, expiry, audience = canonical MCP URL). The MCP server validates it
+  # again and makes every authorization decision.
+  - id: mcp-authenticated
+    name: "MCP (with token)"
+    desc: "Edge JWT check: signature via Keycloak JWKS, issuer, aud = canonical MCP URL; rate limit; 401 rewritten to the RFC 9728 challenge"
+    uri: /mcp
+    priority: 10
+    vars: [["http_authorization", "~*", "^bearer "]]
+    upstream_id: mcp
+    plugin_config_id: edge
+    plugins:
+      openid-connect:
+        client_id: apisix-gateway
+        discovery: http://keycloak:8080/realms/platform/.well-known/openid-configuration
+        bearer_only: true
+        use_jwks: true
+        realm: platform
+        set_access_token_header: false
+        set_userinfo_header: false
+        set_id_token_header: false
+        claim_validator:
+          issuer:
+            valid_issuers: ["${{PUBLIC_URL}}/realms/platform"]
+        claim_schema:
+          type: object
+          required: [aud, sub]
+          properties:
+            aud:
+              anyOf:
+                - { const: "${{PUBLIC_URL}}/mcp" }
+                - { type: array, contains: { const: "${{PUBLIC_URL}}/mcp" } }
+      # MCP clients rediscover the auth server from this challenge.
+      response-rewrite:
+        vars: [["status", "==", 401]]
+        headers:
+          set:
+            WWW-Authenticate: 'Bearer error="invalid_token", resource_metadata="${{PUBLIC_URL}}/.well-known/oauth-protected-resource/mcp", scope="platform:read platform:write offline_access"'
+      limit-count:
+        count: 600
+        time_window: 60
+        key_type: var
+        key: remote_addr
+        rejected_code: 429
+        policy: redis
+        redis_host: redis
+        redis_port: 6379
+      client-control: { max_body_size: 1048576 }
+
+  # Without a token the request goes straight to the MCP server, which answers
+  # 401 with the RFC 9728 resource_metadata challenge that starts the login.
+  - id: mcp-anonymous
+    name: "MCP (no token)"
+    desc: "No bearer token: forwarded so the MCP server answers 401 with resource_metadata, which starts the OAuth login"
+    uri: /mcp
+    priority: 0
+    upstream_id: mcp
+    plugin_config_id: edge
+    plugins:
+      limit-count: { count: 120, time_window: 60, key_type: var, key: remote_addr, rejected_code: 429, policy: redis, redis_host: redis, redis_port: 6379 }
+      client-control: { max_body_size: 1048576 }
+
+  - id: protected-resource-metadata
+    name: "Protected Resource Metadata"
+    desc: "RFC 9728 metadata served by the MCP server"
+    uris: [/.well-known/oauth-protected-resource, /.well-known/oauth-protected-resource/mcp]
+    methods: [GET]
+    upstream_id: mcp
+    plugin_config_id: edge
+
+  # --- Authorization server (Keycloak) -------------------------------------
+  # RFC 8414 path-inserted discovery URLs, mapped onto Keycloak's layout.
+  - id: as-metadata-rfc8414
+    name: "AS metadata (RFC 8414 path)"
+    desc: "Maps the RFC 8414 path-inserted discovery URL onto Keycloak"
+    uri: /.well-known/oauth-authorization-server/realms/platform
+    methods: [GET]
+    upstream_id: keycloak
+    plugin_config_id: edge
+    plugins:
+      proxy-rewrite: { uri: /realms/platform/.well-known/oauth-authorization-server }
+  - id: as-metadata-oidc-inserted
+    name: "OIDC discovery (inserted path)"
+    desc: "Maps the path-inserted OpenID discovery URL onto Keycloak"
+    uri: /.well-known/openid-configuration/realms/platform
+    methods: [GET]
+    upstream_id: keycloak
+    plugin_config_id: edge
+    plugins:
+      proxy-rewrite: { uri: /realms/platform/.well-known/openid-configuration }
+
+  # Dynamic client registration: tight limits.
+  - id: as-registration
+    name: "Dynamic client registration"
+    desc: "Keycloak DCR, tight rate limit (10/min per IP)"
+    uri: /realms/platform/clients-registrations/*
+    priority: 10
+    upstream_id: keycloak
+    plugin_config_id: edge
+    plugins:
+      limit-count: { count: 10, time_window: 60, key_type: var, key: remote_addr, rejected_code: 429, policy: redis, redis_host: redis, redis_port: 6379 }
+      client-control: { max_body_size: 16384 }
+
+  - id: as-token
+    name: "Token endpoint"
+    desc: "Keycloak token endpoint, 120/min per IP"
+    uri: /realms/platform/protocol/openid-connect/token
+    priority: 10
+    methods: [POST, OPTIONS]
+    upstream_id: keycloak
+    plugin_config_id: edge
+    plugins:
+      limit-count: { count: 120, time_window: 60, key_type: var, key: remote_addr, rejected_code: 429, policy: redis, redis_host: redis, redis_port: 6379 }
+      client-control: { max_body_size: 65536 }
+
+  # Login pages, consent, brokering to (mock) Entra, static resources. The
+  # master realm and the admin console are never exposed.
+  - id: as-login
+    name: "Login, consent, broker"
+    desc: "Keycloak login and consent pages for realms platform and corp-entra (mock Entra); master realm and admin console never exposed"
+    uris: [/realms/platform/*, /realms/corp-entra/*, /resources/*]
+    upstream_id: keycloak
+    plugin_config_id: edge
+    plugins:
+      limit-count: { count: 600, time_window: 60, key_type: var, key: remote_addr, rejected_code: 429, policy: redis, redis_host: redis, redis_port: 6379 }
+      client-control: { max_body_size: 65536 }
