@@ -17,6 +17,7 @@ on a laptop with nothing but Docker.
 - [Consoles and dashboards](#consoles-and-dashboards)
 - [How to change things](#how-to-change-things)
 - [How it works](#how-it-works)
+- [FAQ](#faq)
 - [Troubleshooting](#troubleshooting)
 - [Lab simplifications](#lab-simplifications)
 
@@ -29,7 +30,7 @@ flowchart LR
   C["AI client<br/>Claude / ChatGPT"] --> G["APISIX gateway<br/>:9080"]
   G --> M["MCP server<br/>zone eu1"]
   G --> K["Keycloak realm platform<br/>authorization server"]
-  K --> E["Keycloak realm corp-entra<br/>mock Entra ID"]
+  K --> E["Keycloak realm corp-entra<br/>mock company SSO"]
   M --> S[("Postgres<br/>assignments + audit")]
   M --> R[("Redis<br/>rate limits")]
   M -- "token exchange" --> K
@@ -44,7 +45,7 @@ network.
 | --- | --- | --- |
 | **APISIX** | The only public entrance. Checks tokens early, rate-limits, strips smuggled identity headers | `apisix/apisix.yaml` (routes), `apisix/config.yaml` |
 | **Keycloak `platform` realm** | The OAuth server: login, consent, tokens, self-registration of AI clients, token exchange | configured by `bootstrap/bootstrap.mjs` |
-| **Keycloak `corp-entra` realm** | Stands in for the company's Entra ID. Holds the demo users and passwords | `bootstrap/directory.json` |
+| **Keycloak `corp-entra` realm** | Simulates a client company's SSO (e.g. Company A's Entra ID). Holds the demo users and passwords | `bootstrap/directory.json` |
 | **MCP server** | The decision point: which person, which tool, which tenant, which role | `mcp-server/src/` (TypeScript) |
 | **Postgres** | Tenants, assignments (who may work where), audit log. Also Keycloak's database | `db/init/01-schema.sql` |
 | **Redis** | Rate-limit counters per person, tenant and risk tier | — |
@@ -63,7 +64,7 @@ take it away, and something specific breaks or becomes unsafe.
 | AI client | "What does the person want done?" | the visitor asking for something |
 | APISIX gateway | "Is this request well-formed and not an attack?" | the front door with the security scanner |
 | Keycloak (`platform` realm) | "Who is this person, and did they agree to let this AI act for them?" | reception, which checks ID and hands out visitor badges |
-| Mock Entra ID (`corp-entra`) | "Is this really one of our employees?" | the HR system reception phones to confirm |
+| Mock company SSO (`corp-entra`) | "Is this really a user of Company A?" | Company A's own badge office, which reception phones to confirm |
 | MCP server | "May this person do this action, in this tenant, right now?" | the floor manager who checks the badge against the room list |
 | Assignment store (Postgres) | "Which tenants may this person work in, with which role, until when?" | the room-access list |
 | Token exchange + internal token | "Which one room is this key cut for?" | a key that opens one room for five minutes |
@@ -110,16 +111,17 @@ take it away, and something specific breaks or becomes unsafe.
 - **Doesn't:** decide which tenants someone may touch. It knows *who* you are, not *where*
   you may go.
 
-#### Keycloak, realm `corp-entra` (mock Entra ID)
+#### Keycloak, realm `corp-entra` (mock company SSO)
 
-- **Job:** stands in for the company's Microsoft Entra ID. Staff sign in here. Realm
-  `platform` doesn't hold passwords for them: it forwards the login here ("brokering") and
-  trusts the answer.
-- **Why it's there:** staff already have one company login, and disabling someone there
-  should cut their access everywhere. With a real setup, you'd point the `entra` identity
-  provider at your actual Entra tenant.
+- **Job:** simulates the single sign-on of one client company, say **Company A**'s
+  Microsoft Entra ID. Its users sign in here with their company account. Realm `platform`
+  doesn't hold their passwords: it forwards the login here ("brokering") and trusts the answer.
+- **Why it's there:** every client company (Company A, Company B, …) brings its own SSO, and
+  its users should log in with the account they already have. Disabling someone at their
+  company should cut their access here too. In a real setup, you'd point an identity
+  provider at each company's actual SSO. See [FAQ 4](#4-why-are-there-two-keycloak-realms-and-what-does-brokering-a-login-mean).
 - **Doesn't:** talk to the AI clients. They only ever see realm `platform`, one issuer, no
-  matter how many upstream logins exist.
+  matter how many companies' SSOs sit behind it.
 
 #### MCP server (`mcp-server/src/`)
 
@@ -361,7 +363,7 @@ Sign in with `admin` / `admin`. Use **Manage realms** (top left) to switch to `p
 | **Events** | logins, token exchanges, app registrations and failed registrations |
 | **Clients → Client registration** | the rules for AI apps registering themselves |
 
-Realm `corp-entra` is the mock Entra ID; the demo users' passwords live there.
+Realm `corp-entra` is the mock company SSO (Company A's Entra ID, say); the demo users' passwords live there.
 
 ### APISIX dashboard — http://localhost:9180/ui
 
@@ -486,7 +488,7 @@ before they're first created, or run `make reset` to recreate everyone.
 
 **Disable someone** (offboarding): turn **Enabled** off for the user in **both** realms.
 
-- Realm **corp-entra** (like disabling them in Entra): stops new logins.
+- Realm **corp-entra** (like their company disabling them in its SSO): stops new logins.
 - Realm **platform**: stops their existing connection too. Their AI client's next token
   refresh fails with *User disabled*, so access ends within 10 minutes (the access
   token lifetime).
@@ -674,6 +676,235 @@ db/init/               database schema
 scripts/               tunnel + public URL switching
 tests/e2e.mjs          scripted client: register, log in, call tools
 ```
+
+---
+
+## FAQ
+
+Questions a developer new to this stack usually asks, with the answers and where to
+look in the code.
+
+### 1. When Claude first connects to `/mcp`, how does it find out where to log in?
+
+It follows a chain of standard discovery documents. Nothing is configured in the client
+except the MCP URL.
+
+1. Claude calls `POST /mcp` without a token. The MCP server answers **401** with a header
+   that says where to look next:
+   `WWW-Authenticate: Bearer resource_metadata="…/.well-known/oauth-protected-resource/mcp", scope="platform:read platform:write offline_access"`.
+2. Claude fetches that **Protected Resource Metadata** (RFC 9728). It names this server
+   (`resource: http://localhost:9080/mcp`) and its authorization server
+   (`authorization_servers: [".../realms/platform"]`).
+3. Claude fetches the **authorization server metadata** (RFC 8414) from Keycloak. It learns the
+   login, token and registration endpoints, and that PKCE S256 is supported. APISIX maps the
+   RFC 8414 URL shape onto Keycloak's layout (routes `as-metadata-*`).
+4. Claude **registers itself** at the registration endpoint (question 3), then opens the
+   browser for the login with PKCE.
+
+The 401 is what starts the whole flow; without it the client has no way to discover the
+login. Code: `authenticate()` and the `prm` object in `mcp-server/src/server.ts`.
+
+### 2. Why does the MCP server reject a valid Keycloak token that was issued for another app?
+
+Because a token is only valid for the resource it was issued for: its **audience** (`aud`)
+must contain `http://localhost:9080/mcp`. Both APISIX (`claim_schema` on route
+`mcp-authenticated`) and the MCP server (`jwtVerify(..., { audience: config.resource })` in
+`mcp-server/src/auth.ts`) check it.
+
+This prevents **token replay across services**. Without the check, a token someone got for
+a harmless app (or a token leaked by any other service using the same Keycloak) could be
+replayed against the MCP server. The MCP spec requires this check, and forbids the reverse
+too: the MCP server must never forward a token it received to another service (see question 5).
+
+Keycloak puts the audience in through mappers on the `platform:read` / `platform:write` scopes
+(its workaround for RFC 8707 Resource Indicators).
+
+### 3. What is Dynamic Client Registration, and what stops anyone from registering a malicious client?
+
+**Dynamic Client Registration (DCR)** lets an app register itself as an OAuth client with
+one HTTP call, instead of an admin creating it by hand. Claude and ChatGPT need it because
+every user connects their own client instance to arbitrary MCP servers; nobody could pre-create
+all of those in Keycloak.
+
+Anyone can call the registration endpoint, so it's restricted by several layers:
+
+- **Trusted hosts:** every URL in the registration (the login callback and the app's
+  homepage) must be on a host in `dcrTrustedHosts` (`bootstrap/directory.json`). A client
+  can't register a callback on `evil.example`, so it can't receive login codes there.
+- **Consent screen:** a newly registered client can't get a token silently. The person sees
+  the app's name and the permissions it asks for, and must approve.
+- **PKCE:** the login code is useless without the secret the client generated at the start,
+  so an intercepted code can't be redeemed.
+- **Limits:** only the `platform:*` and `offline_access` scopes may be requested, at most 200
+  registered clients, and APISIX allows 10 registrations per minute per IP (route
+  `as-registration`).
+- **Audience-bound tokens:** even a registered client only gets tokens for this MCP server.
+
+What it doesn't stop: an app on an allowed host (such as `localhost`) registering under a
+misleading name. The consent screen and the audit log are the controls there.
+
+### 4. Why are there two Keycloak realms, and what does "brokering" a login mean?
+
+**Realm `corp-entra` simulates an external single sign-on (SSO) system**, the identity
+provider of one of our client companies. In real life every client company brings its own:
+**Company A** signs in with its Microsoft Entra ID, **Company B** with its Okta, Company C with
+Google, and so on. Their users should log in with their own company account, and the
+platform should never store their passwords. In the lab, `corp-entra` plays one of those
+companies. It holds the demo users and their passwords, exactly as Company A's Entra would.
+
+**Realm `platform`** is our own authorization server. It's the only one the AI clients ever
+talk to, whatever company the user belongs to. When it needs to log someone in, it doesn't
+check a password itself; it **brokers** the login to that company's SSO:
+
+```mermaid
+sequenceDiagram
+  participant U as User (Company A)
+  participant P as Keycloak "platform"
+  participant A as Company A SSO (corp-entra)
+  U->>P: log in (started by the AI client)
+  P->>U: redirect to Company A's SSO
+  U->>A: username + password (and MFA)
+  A->>P: authorization code
+  P->>A: exchange code for an id_token (server to server)
+  P->>P: verify signature, find the linked user, add claims
+  P-->>U: platform's own tokens for the AI client
+```
+
+Why broker instead of letting the AI client talk to each company's SSO directly:
+
+- **One issuer:** Claude and ChatGPT know one authorization server, one token format and one
+  client registration, however many client companies we add.
+- **Company-specific rules stay in one place:** each company's groups can be mapped to our
+  roles with Keycloak mappers, per identity provider.
+- **Offboarding follows the company:** when Company A disables someone in its SSO, they can't
+  sign in to the platform any more (see question 10 for existing sessions).
+
+**Adding Company B** means one more identity provider in realm `platform`, plus one
+**Organization** per company. The Organization holds the company's email domains and is
+linked to its identity provider, so Keycloak can send `@company-b.com` users to Company B's
+SSO automatically. See [Add another identity provider](#add-another-identity-provider-eg-a-customers-own-login).
+To simulate Company B locally, you can create a second realm (for example `company-b`) the
+same way `corp-entra` is set up, and add it as a second identity provider.
+
+In the lab, the one company SSO is wired as the default, so the login page jumps straight to
+it (`defaultProvider: "entra"` in `bootstrap.mjs`). The code calls it `entra` because Entra ID
+is the most common case. Brokering is the same whoever is upstream.
+
+### 5. What is token exchange, and why doesn't the MCP server just forward the user's token?
+
+**Token exchange (RFC 8693)** is a standard call to Keycloak's token endpoint: "here is the
+user's token, give me a different token for a different purpose". The MCP server (client
+`platform-mcp-server`) sends the user's token as `subject_token` and asks for scopes
+`tenant-1001 role-supervisor`. Keycloak returns an internal token with:
+
+- `aud: platform-backend`: only the backends accept it
+- `tenant_id: 1001` and `role: supervisor`: exactly one tenant, the one just authorized
+- `act: { sub: "platform-mcp-server" }`: shows the MCP server acted for the person
+- a 5-minute lifetime
+
+Why not forward the user's token:
+
+- **The spec forbids it** ("token passthrough"): a token must only be used at the resource
+  it was issued for.
+- **Least privilege:** the user's token works for every tenant they're assigned to. The
+  internal token works for one tenant, for five minutes. A leaked internal token does far
+  less damage.
+- **The backend doesn't have to trust the MCP server's word.** The tenant is inside a token
+  Keycloak signed, so a bug or a misrouted request can't claim another tenant.
+
+The MCP server caches each internal token per (person, tenant, role) until 30 seconds before
+it expires, and never reuses one across tenants. Code: `internalToken()` in
+`mcp-server/src/backend.ts`; the token check in `backend/server.mjs`.
+
+### 6. If the MCP server validates the token, why does APISIX validate it too? And why not let the gateway inject a trusted `X-Tenant-ID` header?
+
+**Each check guards against a different failure.** APISIX checks cheaply at the edge, so
+junk and expired tokens never cost MCP server capacity, and one gateway can protect many
+services the same way. The MCP server checks because it makes the authorization decision
+and must not depend on how traffic reached it (a misconfigured route, an internal caller).
+The backends check because they hold the data.
+
+**No trusted headers** because a header is only as trustworthy as the network path. If the
+backends believed `X-Tenant-ID`, then anything that can reach them from inside (a
+misrouted request, a compromised container, a bug) could name any tenant by setting a header.
+A signed internal token can't be forged that way. APISIX actively **strips** such headers
+from incoming requests (`proxy-rewrite` in the `edge` plugin config), so nobody can try.
+
+### 7. Why are there two `/mcp` routes in APISIX, and what does `response-rewrite` fix?
+
+Because the MCP login only starts if the 401 response carries the right
+`WWW-Authenticate` header (question 1), and APISIX's `openid-connect` plugin doesn't produce
+that header on its own.
+
+- **`mcp-authenticated`** matches only requests with an `Authorization: Bearer …` header. It
+  runs `openid-connect` to check the token at the edge. If the token is bad (expired, wrong
+  audience), the plugin answers 401, and **`response-rewrite`** replaces its header with
+  `WWW-Authenticate: Bearer error="invalid_token", resource_metadata="…", scope="…"`, so the
+  client knows to refresh or log in again.
+- **`mcp-anonymous`** catches requests with no token and passes them straight to the MCP
+  server, which answers with the correct challenge that starts the login.
+
+Both routes still get the rate limit and size limit. See `apisix/apisix.yaml`, or the
+**Routes** page in the APISIX dashboard.
+
+### 8. Why isn't the list of tenants a person may use stored in the token?
+
+Because tokens are **snapshots**: whatever is inside stays true until the token expires.
+
+- **Stale access:** if the tenant list were in the token, removing an assignment wouldn't take
+  effect until the token expired. Refresh tokens can live much longer.
+- **Size:** staff can have many assignments, and tokens travel on every request.
+- **Separation of concerns:** Keycloak knows *who* you are; the assignment store knows *where*
+  you may go, with which role, until when, and who approved it.
+
+So the token carries only stable, coarse facts (who, which app, `platform:read` /
+`platform:write`), and the MCP server looks up the assignment on **every call**. Lookups are
+cached for 60 seconds per (person, tenant), so an assignment change takes effect within
+a minute.
+
+The trade-off: one database lookup per call (mostly served from the cache), and the MCP
+server depends on the store being available. Code: `getAssignment()` in `mcp-server/src/store.ts`.
+
+### 9. How does plan → execute work, and what stops the AI from reusing a confirmation?
+
+Tools that change data (tiers T2 and T3) run in two steps:
+
+1. **Plan:** the first call doesn't change anything. It returns what would happen (target
+   tenant, objects, effect, count, estimated cost) plus a `confirmation_id`.
+2. **Execute:** the AI shows the plan to the user and, once they agree, calls the same tool
+   again with exactly the same arguments plus that `confirmation_id`.
+
+The `confirmation_id` is built so it can't be reused:
+
+- **Signed** with HMAC using a key only the MCP server has, so it can't be forged.
+- **Bound** to the person, the tenant, the tool and a hash of the arguments. Changing
+  campaign 501 to 502 fails with *"arguments changed since the plan"*.
+- **Expires** after 5 minutes.
+- **Single use:** its id is recorded in Postgres (`confirmations_used`) on execute, so a
+  replay fails with *"already used"*, even across several MCP server copies.
+
+What it doesn't guarantee: that the AI really asked the user. A model could call execute
+right after the plan. T3 plans instruct the AI to restate the plan and get an explicit yes,
+and every plan and execute is audited. A client that supports MCP *elicitation* could put a
+real confirmation dialog in front of the user; the lab doesn't use that yet. Code:
+`issueConfirmation()` / `verifyConfirmation()` in `mcp-server/src/guards.ts`.
+
+### 10. If I revoke someone's access, how long until it takes effect?
+
+It depends on what you revoke. The key fact: **the MCP server validates access tokens
+locally** (signature and expiry). It doesn't ask Keycloak on every call, so an access token
+that was already issued keeps working until it expires, at most **10 minutes**.
+
+| Action | Effect on tool calls | Where |
+| --- | --- | --- |
+| Remove or expire an **assignment** | **Within 60 s** for that tenant (assignment cache). Fastest way to cut tenant access | `directory.json` + `make bootstrap` |
+| **Revoke consent** for the app | Refresh and offline tokens stop working now; the current access token works for up to 10 min | Keycloak → Users → user → Consents |
+| **Disable the user** in realm `platform` | Next refresh fails (*User disabled*); up to 10 min | Keycloak → Users |
+| **Disable the user** in the company SSO (`corp-entra`) only | Blocks new logins, but **not** an existing session: Keycloak doesn't recheck the upstream on refresh | Keycloak realm `corp-entra` |
+
+For a complete offboarding: remove the assignments (cuts tenant access within a minute), then
+disable the user in realm `platform` and in the company SSO. To shrink the 10-minute window,
+lower `accessTokenLifespan` in `bootstrap/bootstrap.mjs`. The trade-off is more frequent refreshes.
 
 ---
 
