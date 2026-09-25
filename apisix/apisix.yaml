@@ -25,11 +25,13 @@ upstreams:
 
 plugin_configs:
   - id: edge
-    desc: "Edge controls on every route: request id, identity-header stripping, Prometheus"
+    desc: "Edge controls on every route: gateway request id, identity-header stripping, Prometheus"
     plugins:
-      request-id: { header_name: X-Request-Id, include_in_response: true }
       proxy-rewrite:
         headers:
+          # Always the gateway's own id (the one in its access log), never one a
+          # client sent: services behind log it, so every hop can be traced back here.
+          set: { X-Request-Id: "$apisix_request_id" }
           remove: [X-Tenant-ID, X-Company, X-User, X-User-Id, X-Userinfo, X-Access-Token, X-ID-Token, X-Forwarded-User, X-Remote-User, X-Auth-Request-User]
       prometheus: {}
 

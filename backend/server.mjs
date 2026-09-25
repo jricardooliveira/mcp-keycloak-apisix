@@ -15,6 +15,16 @@ app.use(express.json({ limit: "256kb" }));
 
 app.get("/healthz", (_req, res) => res.json({ ok: true, service: SERVICE }));
 
+// One log line per request, with the request id the MCP server forwarded (the
+// gateway's), so a call can be followed gateway -> MCP server -> here.
+app.use((req, res, next) => {
+  res.on("finish", () => console.log(JSON.stringify({
+    type: "http", service: SERVICE, request_id: req.get("x-request-id") ?? null,
+    method: req.method, path: req.originalUrl.split("?")[0], status: res.statusCode, tenant_id: req.ctx?.tenantId,
+  })));
+  next();
+});
+
 // --- internal JWT middleware -------------------------------------------------
 app.use(async (req, res, next) => {
   const token = req.headers.authorization?.match(/^Bearer (.+)$/)?.[1];

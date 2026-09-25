@@ -1,4 +1,4 @@
-.PHONY: up down reset test test-readonly tunnel local logs audit assignments claude gateway-sync bootstrap
+.PHONY: up down reset test test-readonly tunnel local logs audit assignments claude gateway-sync bootstrap trace
 
 up: ## Build and start everything on http://localhost:9080
 	@test -f .env || echo "PUBLIC_URL=http://localhost:9080" > .env
@@ -39,6 +39,9 @@ bootstrap: ## Apply bootstrap/directory.json (tenants, staff, assignments, DCR h
 
 gateway-sync: ## Reload apisix/apisix.yaml into the gateway (undoes dashboard edits)
 	docker compose up --build --force-recreate --exit-code-from gateway-seed gateway-seed
+
+trace: ## Live trace: each request through APISIX -> MCP server -> backend, by request id
+	@node scripts/trace.mjs
 
 logs: ## Follow MCP server + gateway logs
 	docker compose logs -f mcp-server apisix

@@ -47,7 +47,7 @@ export interface BackendClient {
   routes: string[];
 }
 
-export function backendClient(getToken: () => Promise<string>, tenantId: number): BackendClient {
+export function backendClient(getToken: () => Promise<string>, tenantId: number, requestId: string): BackendClient {
   const routes: string[] = [];
   return {
     routes,
@@ -56,7 +56,7 @@ export function backendClient(getToken: () => Promise<string>, tenantId: number)
       routes.push(`${service} ${method} ${service === "rest-api" ? "/1.0" : ""}${path.split("?")[0]}`);
       const res = await fetch(base + path, {
         method,
-        headers: { authorization: `Bearer ${await getToken()}`, ...(body !== undefined && { "content-type": "application/json" }) },
+        headers: { authorization: `Bearer ${await getToken()}`, "x-request-id": requestId, ...(body !== undefined && { "content-type": "application/json" }) },
         body: body === undefined ? undefined : JSON.stringify(body),
         signal: AbortSignal.timeout(15_000),
       });

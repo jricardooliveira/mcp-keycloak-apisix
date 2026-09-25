@@ -405,6 +405,7 @@ make reset         # stop and delete all data (fresh start on next make up)
 make logs          # follow the MCP server and gateway logs
 make audit         # last 30 tool calls: who, tenant, tool, allowed/denied and why
 make assignments   # who may work in which tenant
+make trace         # live: every request through APISIX -> MCP server -> backend
 ```
 
 ---
@@ -537,6 +538,38 @@ company's users and passwords, as their real SSOs would.
 Click the gear icon, enter `local-apisix-admin-key`. **Routes** lists the 8 gateway
 routes with a description each; **View** shows a route's plugins (token check, rate
 limit, …). **Upstreams** shows the MCP server and Keycloak.
+
+### Live request trace — `make trace`
+
+Shows, live, that every request is handled by APISIX first. APISIX stamps each request
+with its own id (the one in its access log) and overwrites any `X-Request-Id` a client
+sent. The MCP server and the backends log that same id, so the trace groups the lines of
+one request and prints the gateway first:
+
+```text
+10:20:43 GATEWAY  dd5daf4e  POST /mcp  → mcp-server  200  39 ms, 192.168.16.1, node
+           MCP      dd5daf4e  tools/call list_campaigns  200  marta@masikea.example
+             audit    tenant 1001  T0  allowed
+             BACKEND  dd5daf4e  portal-api GET /campaign  200  tenant 1001
+10:20:43 GATEWAY  80fe2827  POST /mcp  → mcp-server  200  8 ms, 192.168.16.1, node
+           MCP      80fe2827  tools/call list_campaigns  200  marta@masikea.example
+             audit    tenant 1002  T0  denied  tenant 1002 (VodaFundas) belongs to another company; …
+10:20:43 GATEWAY  e8995b4b  POST /mcp  → mcp-server  401  1 ms, 192.168.16.1, curl/8.7.1
+           MCP      e8995b4b  POST /mcp  401  no token
+```
+
+Login traffic shows up too (`→ keycloak`), as do requests APISIX stopped itself
+(`stopped at the gateway`, for example a bad token or a rate limit). Anything that reaches
+the MCP server **without** passing APISIX is flagged:
+
+```text
+⚠ DIRECT REQUEST  POST /mcp  did not come through the gateway
+✗ NOT SEEN AT GATEWAY  direct-f  (reached a service without an APISIX access log line)
+```
+
+In this lab that can only happen from inside the Docker network, because the MCP server's
+port isn't published. The same ids are in the `request_id` column of the audit log
+(`make audit`). To see raw lines instead: `docker compose logs -f apisix mcp-server`.
 
 ### Mock API docs — http://localhost:8082
 

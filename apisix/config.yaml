@@ -37,6 +37,11 @@ deployment:
 
 nginx_config:
   error_log_level: warn
+  http:
+    # Smaller than one log line, so every access log line is written at once
+    # (the default 16 KB buffer delays lines by up to 3 s, which makes live
+    # tracing with `make trace` confusing).
+    access_log_buffer: 128
 
 plugin_attr:
   prometheus:

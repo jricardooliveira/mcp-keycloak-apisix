@@ -23,11 +23,11 @@ const text = (value: unknown, isError = false): CallToolResult => ({
 // risk tier (rate limit, confirmation) -> token exchange -> backend. Any
 // failure stops the call and is audited.
 
-async function invoke(tool: ToolDef, principal: Principal, rawArgs: Record<string, any>): Promise<CallToolResult> {
+async function invoke(tool: ToolDef, principal: Principal, rawArgs: Record<string, any>, requestId: string): Promise<CallToolResult> {
   const started = Date.now();
   const { confirmation_id: confirmationId, ...args } = rawArgs;
   const audit: AuditRecord = {
-    requestId: randomUUID(), subject: principal.subject, email: principal.email, principalType: principal.principalType,
+    requestId, subject: principal.subject, email: principal.email, principalType: principal.principalType,
     clientId: principal.clientId, tool: tool.name, tier: tool.tier, tenantId: args.tenant_id,
     argsHash: hashArgs(args), argsRedacted: redactArgs(args), confirmationId: confirmationId?.slice(0, 16), outcome: "denied",
   };
@@ -56,7 +56,7 @@ async function invoke(tool: ToolDef, principal: Principal, rawArgs: Record<strin
       }
       ctx.tenant = tenant;
       ctx.role = assignment.role;
-      ctx.backend = backendClient(() => internalToken(principal.subject, principal.accessToken, tenantId, assignment.role), tenantId);
+      ctx.backend = backendClient(() => internalToken(principal.subject, principal.accessToken, tenantId, assignment.role), tenantId, requestId);
     }
 
     const limited = await checkRateLimit(principal.subject, tenantId ?? "none", tool.tier);
@@ -108,7 +108,7 @@ async function invoke(tool: ToolDef, principal: Principal, rawArgs: Record<strin
 
 // --- MCP server per request (stateless) ----------------------------------------------
 
-function buildServer(principal: Principal): McpServer {
+function buildServer(principal: Principal, requestId: string): McpServer {
   const server = new McpServer(
     { name: config.serverName, title: "CoreCenas Contact Center", version: "0.1.0" },
     {
@@ -144,7 +144,7 @@ function buildServer(principal: Principal): McpServer {
           openWorldHint: !!tool.openWorld,
         },
       },
-      (args) => invoke(tool, principal, args as Record<string, any>),
+      (args) => invoke(tool, principal, args as Record<string, any>, requestId),
     );
   }
   return server;
@@ -157,6 +157,26 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "1mb" }));
 
 app.get("/healthz", (_req, res) => res.json({ ok: true, server: config.serverName }));
+
+// One log line per request, keyed by the gateway's request id. APISIX always
+// sets X-Request-Id to the id in its own access log, so every line here can be
+// matched to the gateway line before it. A request without one did not come
+// through the gateway, and is flagged.
+app.use((req, res, next) => {
+  const gatewayId = req.get("x-request-id");
+  res.locals.requestId = gatewayId ?? `direct-${randomUUID()}`;
+  res.locals.viaGateway = Boolean(gatewayId);
+  res.on("finish", () => {
+    const rpc = Array.isArray(req.body) ? req.body[0] : req.body;
+    console.log(JSON.stringify({
+      type: "http", mcp_server: config.serverName, request_id: res.locals.requestId, via_gateway: res.locals.viaGateway,
+      method: req.method, path: req.path, status: res.statusCode, subject: res.locals.subject,
+      rpc: rpc?.method, tool: rpc?.method === "tools/call" ? rpc.params?.name : undefined,
+    }));
+  });
+  if (!gatewayId) console.warn(JSON.stringify({ type: "warning", message: "request did not come through the gateway", method: req.method, path: req.path }));
+  next();
+});
 
 // RFC 9728 Protected Resource Metadata, at both well-known paths.
 const prm = {
@@ -186,6 +206,7 @@ async function authenticate(req: Request, res: Response): Promise<Principal | nu
 app.post("/mcp", async (req, res) => {
   const principal = await authenticate(req, res);
   if (!principal) return;
+  res.locals.subject = principal.email ?? principal.subject;
 
   // Step-up: calling a known tool without its scope -> 403 insufficient_scope.
   const calls = (Array.isArray(req.body) ? req.body : [req.body]).filter((m: any) => m?.method === "tools/call");
@@ -199,7 +220,7 @@ app.post("/mcp", async (req, res) => {
     }
   }
 
-  const server = buildServer(principal);
+  const server = buildServer(principal, res.locals.requestId);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
   res.on("close", () => {
     transport.close();
